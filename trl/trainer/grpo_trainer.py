@@ -553,7 +553,7 @@ class GRPOTrainer(Trainer):
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys: Optional[list[str]] = None):
         with torch.no_grad():
             with self.compute_loss_context_manager():
-                loss = self.compute_loss(model, inputs)
+                loss = self.compute_loss(self.model_wrapped, inputs)
             loss = loss.mean().detach()
         return loss, None, None
 
