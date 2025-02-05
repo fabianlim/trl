@@ -174,3 +174,7 @@ class GRPOConfig(TrainingArguments):
         default=0.04,
         metadata={"help": "KL coefficient."},
     )
+    cliprange: float = field(
+        default=0.2,
+        metadata={"help": "For clipping."},
+    )

@@ -315,7 +315,10 @@ class GRPOTrainer(Trainer):
                         device=vllm_device,
                         gpu_memory_utilization=self.args.vllm_gpu_memory_utilization,
                     )
-                    self.llm.llm_engine.tokenizer.eos_token_id = 151643
+                    if processing_class is not None:
+                        # make sure its the same
+                        self.llm.set_tokenizer(processing_class)
+
                 self.sampling_params = SamplingParams(
                     n=self.num_generations,
                     temperature=args.temperature,
@@ -517,16 +520,13 @@ class GRPOTrainer(Trainer):
         mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
         std_grouped_rewards = std_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
         advantages = (rewards - mean_grouped_rewards) / (std_grouped_rewards + 1e-4)
-        # import pdb; pdb.set_trace()
 
         # x - x.detach() allows for preserving gradients from x
-        cliprange = 0.2
         ratio = torch.exp(per_token_logps - per_token_logps.detach())
         pg_losses = ratio * advantages.unsqueeze(1)
-        pg_losses2 = torch.clamp(ratio, 1.0 - cliprange, 1.0 + cliprange) * advantages.unsqueeze(1)
+        pg_losses2 = torch.clamp(ratio, 1.0 - self.args.cliprange, 1.0 + self.args.cliprange) * advantages.unsqueeze(1)
         per_token_loss = torch.min(pg_losses, pg_losses2)
         per_token_loss = -(per_token_loss - self.beta * per_token_kl)
-        # loss = ((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
         loss = (per_token_loss * completion_mask).sum() / completion_mask.sum()
 
         # Log the metrics
