@@ -277,6 +277,10 @@ class GRPOTrainer(Trainer):
             optimizers=optimizers,
         )
 
+        if self.ref_model is not None and not is_deepspeed_zero3_enabled():
+            # NOTE: we still should FSDP the model
+            self.ref_model = self.accelerator.prepare(self.ref_model)
+
         if self.use_vllm:
             if not is_vllm_available():
                 raise ImportError(
@@ -314,6 +318,10 @@ class GRPOTrainer(Trainer):
                         model=model.name_or_path,
                         device=vllm_device,
                         gpu_memory_utilization=self.args.vllm_gpu_memory_utilization,
+                        max_num_seqs=self.args.vllm_max_num_seqs,
+                        hf_overrides = {
+                            'max_position_embeddings': self.max_prompt_length + self.max_completion_length
+                        }
                     )
                     if processing_class is not None:
                         # make sure its the same
@@ -391,7 +399,12 @@ class GRPOTrainer(Trainer):
         if self.args.use_vllm:
             # First, have main process load weights if needed
             if self.state.global_step != self._last_loaded_step:
-                with unwrap_model_for_generation(model, self.accelerator) as unwrapped_model:
+                # this patch is for accelerate.utils.other.extract_model_from_parallel
+                # because otherwise it will mess with the top-level FSDP wrapper
+                with (
+                    patch("accelerate.utils.other.is_torch_distributed_available", return_value=False),
+                    unwrap_model_for_generation(model, self.accelerator) as unwrapped_model
+                ):
                     state_dict = unwrapped_model.state_dict()
                 if self.accelerator.is_main_process:
                     llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model

@@ -144,6 +144,13 @@ class GRPOConfig(TrainingArguments):
             "out-of-memory (OOM) errors during initialization."
         },
     )
+    vllm_max_num_seqs : float = field(
+        default=128,
+        metadata={
+            "help": "This is the max number of sequences that will be processed concurrently. "
+            "A larger number will increase throughput at a cost of cache memory."
+        },
+    )
 
     # Parameters that control the training
     learning_rate: float = field(
