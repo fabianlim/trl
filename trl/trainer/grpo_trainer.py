@@ -16,7 +16,7 @@ import os
 import textwrap
 import warnings
 from collections import defaultdict
-from typing import Any, Callable, Optional, Union
+from typing import Any, Callable, Optional, Union, Dict, List
 from unittest.mock import patch
 
 import torch
@@ -422,6 +422,7 @@ class GRPOTrainer(Trainer):
             # Broadcast the completions from the main process to all processes, ensuring each process receives its
             # corresponding slice.
             completion_ids = broadcast_object_list(completion_ids, from_process=0)
+
             process_slice = slice(
                 self.accelerator.process_index * len(prompts) * self.num_generations,
                 (self.accelerator.process_index + 1) * len(prompts) * self.num_generations,
@@ -562,6 +563,27 @@ class GRPOTrainer(Trainer):
         self._metrics["kl"].append(self.accelerator.gather_for_metrics(mean_kl).mean().item())
 
         return loss
+    
+    def evaluate(
+        self,
+        eval_dataset: Optional[Union[Dataset, Dict[str, Dataset]]] = None,
+        ignore_keys: Optional[List[str]] = None,
+        metric_key_prefix: str = "eval",
+    ) -> Dict[str, float]:
+
+        # similar to self.log, see below
+
+        # these will not contain the gpro metrics 
+        metrics = super().evaluate(eval_dataset, ignore_keys, metric_key_prefix)
+
+        # handle the grpo metrics
+        gpro_metrics = {f"{metric_key_prefix}_{key}": sum(val) / len(val) for key, val in self._metrics.items()}  # average the metrics
+
+        # clear them
+        self._metrics.clear()
+
+        # merge them
+        return {**metrics, **gpro_metrics}
 
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys: Optional[list[str]] = None):
         with torch.no_grad():
@@ -575,7 +597,9 @@ class GRPOTrainer(Trainer):
 
         # This method can be called both in training and evaluation. When called in evaluation, the keys in `logs`
         # start with "eval_". We need to add the prefix "eval_" to the keys in `metrics` to match the format.
+        for_eval = False
         if next(iter(logs.keys())).startswith("eval_"):
+            for_eval = True
             metrics = {f"eval_{key}": val for key, val in metrics.items()}
 
         logs = {**logs, **metrics}
@@ -583,7 +607,10 @@ class GRPOTrainer(Trainer):
             super().log(logs, start_time)
         else:  # transformers<=4.46
             super().log(logs)
-        self._metrics.clear()
+
+        if not for_eval:
+            # if its for eval, do not clear, coz we need to capture them
+            self._metrics.clear()
 
     def create_model_card(
         self,
