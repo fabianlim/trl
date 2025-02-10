@@ -210,7 +210,10 @@ class GRPOTrainer(Trainer):
 
         # Processing class
         if processing_class is None:
-            processing_class = AutoTokenizer.from_pretrained(model.config._name_or_path, padding_side="left")
+            processing_class = AutoTokenizer.from_pretrained(
+                model.config._name_or_path, padding_side="left",
+                trust_remote_code=model_init_kwargs.get("trust_remote_code", False)
+            )
 
         # Reward functions
         if not isinstance(reward_funcs, list):
@@ -234,7 +237,9 @@ class GRPOTrainer(Trainer):
         for i, (reward_processing_class, reward_func) in enumerate(zip(reward_processing_classes, reward_funcs)):
             if isinstance(reward_func, PreTrainedModel):
                 if reward_processing_class is None:
-                    reward_processing_class = AutoTokenizer.from_pretrained(reward_func.config._name_or_path)
+                    reward_processing_class = AutoTokenizer.from_pretrained(
+                        reward_func.config._name_or_path, trust_remote_code=model_init_kwargs.get("trust_remote_code", False)
+                    )
                 if reward_processing_class.pad_token_id is None:
                     reward_processing_class.pad_token = reward_processing_class.eos_token
                 # The reward model computes the reward for the latest non-padded token in the input sequence.
@@ -321,7 +326,8 @@ class GRPOTrainer(Trainer):
                         max_num_seqs=self.args.vllm_max_num_seqs,
                         hf_overrides = {
                             'max_position_embeddings': self.max_prompt_length + self.max_completion_length
-                        }
+                        },
+                        trust_remote_code=model_init_kwargs.get("trust_remote_code", False),
                     )
                     if processing_class is not None:
                         # make sure its the same
