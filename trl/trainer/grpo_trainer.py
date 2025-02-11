@@ -43,7 +43,8 @@ from ..data_utils import apply_chat_template, is_conversational, maybe_apply_cha
 from ..import_utils import is_vllm_available
 from ..models import create_reference_model, prepare_deepspeed, unwrap_model_for_generation
 from .grpo_config import GRPOConfig
-from .utils import generate_model_card, get_comet_experiment_url, pad
+from .utils import generate_model_card, get_comet_experiment_url, pad, selective_log_softmax
+
 
 
 if is_peft_available():
@@ -470,13 +471,20 @@ class GRPOTrainer(Trainer):
             ).logits  # (B, L, V)
             logits = logits[:, :-1, :]  # (B, L-1, V), exclude the last logit: it corresponds to the next token pred
 
+            input_ids = input_ids[:, -logits_to_keep:]
+            # For transformers<=4.48, logits_to_keep argument isn't supported, so here we drop logits ourselves.
+            # See https://github.com/huggingface/trl/issues/2770
+            logits = logits[:, -logits_to_keep:]
+
             # Compute the log probabilities for the input tokens. Use a loop to reduce memory peak.
-            per_token_logps = []
-            for logits_row, input_ids_row in zip(logits, input_ids[:, -logits_to_keep:]):
-                log_probs = logits_row.log_softmax(dim=-1)
-                token_log_prob = torch.gather(log_probs, dim=1, index=input_ids_row.unsqueeze(1)).squeeze(1)
-                per_token_logps.append(token_log_prob)
-            return torch.stack(per_token_logps)
+            # per_token_logps = []
+            # for logits_row, input_ids_row in zip(logits, input_ids[:, -logits_to_keep:]):
+            #     log_probs = logits_row.log_softmax(dim=-1)
+            #     token_log_prob = torch.gather(log_probs, dim=1, index=input_ids_row.unsqueeze(1)).squeeze(1)
+            #     per_token_logps.append(token_log_prob)
+            # return torch.stack(per_token_logps)
+            return selective_log_softmax(logits, input_ids)  #  compute logprobs for the input tokens
+
 
         logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
         per_token_logps = get_per_token_logps(model, prompt_completion_ids, attention_mask, logits_to_keep)
