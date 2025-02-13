@@ -330,9 +330,12 @@ class GRPOTrainer(Trainer):
                         },
                         trust_remote_code=model_init_kwargs.get("trust_remote_code", False),
                     )
-                    if processing_class is not None:
-                        # make sure its the same
-                        self.llm.set_tokenizer(processing_class)
+                    # FIXME: while this seems like a good idea, it seems that 
+                    # this will cause problems in HF, because tokenizer will be replaced by a dynamic
+                    # class, which causes it to be unrecognizable when saved
+                    # if processing_class is not None:
+                    #     # make sure its the same
+                    #     self.llm.set_tokenizer(processing_class)
 
                 self.sampling_params = SamplingParams(
                     n=self.num_generations,
