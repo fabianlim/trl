@@ -338,6 +338,10 @@ class GRPOTrainer(Trainer):
             optimizers=optimizers,
         )
 
+        if self.ref_model is not None and not is_deepspeed_zero3_enabled():
+            # NOTE: we still should FSDP the model
+            self.ref_model = self.accelerator.prepare(self.ref_model)
+
         # Check if the per_device_train/eval_batch_size * num processes can be divided by the number of generations
         num_processes = self.accelerator.num_processes
         global_batch_size = args.per_device_train_batch_size * num_processes
@@ -411,6 +415,9 @@ class GRPOTrainer(Trainer):
                         # This is particularly useful here because we generate completions from the same prompts.
                         enable_prefix_caching=True,
                         max_model_len=self.args.vllm_max_model_len,
+                        hf_overrides = {
+                            'max_position_embeddings': self.max_prompt_length + self.max_completion_length
+                        }
                     )
                 self.sampling_params = SamplingParams(
                     temperature=args.temperature,
@@ -488,9 +495,12 @@ class GRPOTrainer(Trainer):
         return selective_log_softmax(logits, input_ids)  #  compute logprobs for the input tokens
 
     def _move_model_to_vllm(self):
-        with unwrap_model_for_generation(
-            self.model, self.accelerator, gather_deepspeed3_params=self.args.ds3_gather_for_generation
-        ) as unwrapped_model:
+        # this patch is for accelerate.utils.other.extract_model_from_parallel
+        # because otherwise it will mess with the top-level FSDP wrapper
+        with (
+            patch("accelerate.utils.other.is_torch_distributed_available", return_value=False),
+            unwrap_model_for_generation(self.model, self.accelerator) as unwrapped_model
+        ):
             if is_compiled_module(unwrapped_model):
                 unwrapped_model = unwrapped_model._orig_mod
             if is_peft_model(unwrapped_model):
@@ -718,7 +728,14 @@ class GRPOTrainer(Trainer):
 
         # x - x.detach() allows for preserving gradients from x
         advantages = inputs["advantages"]
-        per_token_loss = torch.exp(per_token_logps - per_token_logps.detach()) * advantages.unsqueeze(1)
+
+        ratio = torch.exp(per_token_logps - per_token_logps.detach())
+        # in the forward pass, ratio will be 1, so pg_losses == pg_losses2. But according to the PPO math
+        # https://spinningup.openai.com/en/latest/algorithms/ppo.html, applying the clamp and min will
+        # will regularize the gradients in the backward pass.
+        pg_losses = ratio * advantages.unsqueeze(1) # per-token-loss (no clamp)
+        pg_losses2 = torch.clamp(ratio, 1.0 - self.args.cliprange, 1.0 + self.args.cliprange) * advantages.unsqueeze(1)
+        per_token_loss = torch.min(pg_losses, pg_losses2)
         per_token_loss = -(per_token_loss - self.beta * per_token_kl)
         loss = (per_token_loss * completion_mask).sum() / completion_mask.sum()
 
@@ -726,7 +743,7 @@ class GRPOTrainer(Trainer):
         completion_length = self.accelerator.gather_for_metrics(completion_mask.sum(1)).float().mean().item()
         self._metrics["completion_length"].append(completion_length)
 
-        mean_kl = ((per_token_kl * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
+        mean_kl = (per_token_kl * completion_mask).sum() / completion_mask.sum()
         self._metrics["kl"].append(self.accelerator.gather_for_metrics(mean_kl).mean().item())
 
         return loss
