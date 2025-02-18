@@ -718,7 +718,14 @@ class GRPOTrainer(Trainer):
 
         # x - x.detach() allows for preserving gradients from x
         advantages = inputs["advantages"]
-        per_token_loss = torch.exp(per_token_logps - per_token_logps.detach()) * advantages.unsqueeze(1)
+
+        ratio = torch.exp(per_token_logps - per_token_logps.detach())
+        # in the forward pass, ratio will be 1, so pg_losses == pg_losses2. But according to the PPO math
+        # https://spinningup.openai.com/en/latest/algorithms/ppo.html, applying the clamp and min will
+        # will regularize the gradients in the backward pass.
+        pg_losses = ratio * advantages.unsqueeze(1) # per-token-loss (no clamp)
+        pg_losses2 = torch.clamp(ratio, 1.0 - self.args.cliprange, 1.0 + self.args.cliprange) * advantages.unsqueeze(1)
+        per_token_loss = torch.min(pg_losses, pg_losses2)
         per_token_loss = -(per_token_loss - self.beta * per_token_kl)
         loss = (per_token_loss * completion_mask).sum() / completion_mask.sum()
 
@@ -726,7 +733,7 @@ class GRPOTrainer(Trainer):
         completion_length = self.accelerator.gather_for_metrics(completion_mask.sum(1)).float().mean().item()
         self._metrics["completion_length"].append(completion_length)
 
-        mean_kl = ((per_token_kl * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
+        mean_kl = (per_token_kl * completion_mask).sum() / completion_mask.sum()
         self._metrics["kl"].append(self.accelerator.gather_for_metrics(mean_kl).mean().item())
 
         return loss
