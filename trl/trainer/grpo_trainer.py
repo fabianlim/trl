@@ -338,6 +338,10 @@ class GRPOTrainer(Trainer):
             optimizers=optimizers,
         )
 
+        if self.ref_model is not None and not is_deepspeed_zero3_enabled():
+            # NOTE: we still should FSDP the model
+            self.ref_model = self.accelerator.prepare(self.ref_model)
+
         # Check if the per_device_train/eval_batch_size * num processes can be divided by the number of generations
         num_processes = self.accelerator.num_processes
         global_batch_size = args.per_device_train_batch_size * num_processes
@@ -411,6 +415,9 @@ class GRPOTrainer(Trainer):
                         # This is particularly useful here because we generate completions from the same prompts.
                         enable_prefix_caching=True,
                         max_model_len=self.args.vllm_max_model_len,
+                        hf_overrides = {
+                            'max_position_embeddings': self.max_prompt_length + self.max_completion_length
+                        }
                     )
                 self.sampling_params = SamplingParams(
                     temperature=args.temperature,
@@ -487,9 +494,12 @@ class GRPOTrainer(Trainer):
         return selective_log_softmax(logits, input_ids)  #  compute logprobs for the input tokens
 
     def _move_model_to_vllm(self):
-        with unwrap_model_for_generation(
-            self.model, self.accelerator, gather_deepspeed3_params=self.args.ds3_gather_for_generation
-        ) as unwrapped_model:
+        # this patch is for accelerate.utils.other.extract_model_from_parallel
+        # because otherwise it will mess with the top-level FSDP wrapper
+        with (
+            patch("accelerate.utils.other.is_torch_distributed_available", return_value=False),
+            unwrap_model_for_generation(self.model, self.accelerator) as unwrapped_model
+        ):
             if is_compiled_module(unwrapped_model):
                 unwrapped_model = unwrapped_model._orig_mod
             if is_peft_model(unwrapped_model):
