@@ -22,6 +22,7 @@ from unittest.mock import patch
 import torch
 import torch.utils.data
 import transformers
+from accelerate import Accelerator
 from accelerate.utils import broadcast_object_list, gather, gather_object, is_peft_model, set_seed
 from accelerate.utils.other import is_compiled_module
 from datasets import Dataset, IterableDataset
@@ -104,7 +105,86 @@ class RepeatRandomSampler(Sampler):
     def __len__(self):
         return self.num_samples * self.repeat_count
 
+def build_init_world_group(ranks, f):
+    # hijack
+    def _wrapper(_, *args, **kwargs):
+        return f(ranks, *args, **kwargs)
+    return _wrapper
 
+from vllm.distributed.parallel_state import (
+    init_world_group as _init_world_group,
+    init_model_parallel_group as _init_model_parallel_group
+)
+
+# To be used if VLLM is generating 
+class VLLMDeviceManager:
+
+    def __init__(
+        self, accelerator: Accelerator,
+        vllm_device: str,
+    ):
+        self.accelerator = accelerator
+
+        # detect if we want sharding
+        # new format auto:<SHARD>:<TP>
+        self.mini_shards = 1
+        self.tensor_parallel = 1
+
+        # get the local world size
+        # https://pytorch.org/docs/stable/elastic/run.html#environment-variables
+        self.local_world_size = int(os.environ["LOCAL_WORLD_SIZE"])
+        self.mini_shard_size = self.local_world_size // self.mini_shards
+
+        # NOTE: some draft code
+        # if vllm_device.startswith("auto:"):
+        #     vllm_device, self.mini_shards, self.tensor_parallel = vllm_device.split(":")
+
+        # NOTE: disable these checks first. until finalize how to handle the distributed devices
+        # vllm_device = self.args.vllm_device
+        # if vllm_device == "auto":
+        #     if torch.cuda.device_count() == 1:
+        #         vllm_device = "cuda:0"  # particular case when training with onyl 1 GPU: share it
+        #     else:
+        #         vllm_device = f"cuda:{self.accelerator.num_processes}"  # take the next GPU idx
+        # # Check that the requested device is available
+        # if vllm_device.split(":")[0] == "cuda" and int(vllm_device.split(":")[1]) >= torch.cuda.device_count():
+        #     raise ValueError(
+        #         f"The requested device for vllm ({vllm_device}) is not available. You are likely using vLLM "
+        #         "without restricting the number of GPUs for training. Set the `--num_processes` argument to a "
+        #         "value lower than the number of GPUs available on your machine—typically, reducing it by one "
+        #         f"is sufficient. In your case: `--num_processes {torch.cuda.device_count() - 1}`."
+        #     )
+        # # Check that the requested device is not also used for training
+        # if vllm_device in {f"cuda:{idx}" for idx in range(self.accelerator.num_processes)}:
+        #     warnings.warn(
+        #         f"The requested device {vllm_device} is also being used for training. For higher throughput "
+        #         "and to avoid out-of-memory errors, it is recommended to use a dedicated device for vLLM. "
+        #         "If this is intentional, you may ignore this warning but should adjust "
+        #         "`vllm_gpu_memory_utilization` accordingly."
+        #     )
+        
+    @property
+    def is_vllm_process(self):
+        if self.mini_shards == 1:
+            return self.accelerator.is_local_main_process
+        return self.accelerator.local_process_index % self.mini_shard_size == 0
+
+    @property
+    def vllm_shard_rank(self):
+        return self.accelerator.local_process_index // self.mini_shard_size
+    
+    # NOTE: some draft code
+    # @property
+    # def vllm_device(self):
+    #     sz = self.local_world_size + self.vllm_shard_rank * self.tensor_parallel
+    #     return [sz + i for i in range(self.tensor_parallel)]
+
+    @property
+    def vllm_device(self):
+        # for now the vllm will occupy the GPU at the end of the local
+        # island
+        return self.local_world_size
+# 
 class GRPOTrainer(Trainer):
     """
     Trainer for the Group Relative Policy Optimization (GRPO) method. This algorithm was initially proposed in the
@@ -374,40 +454,41 @@ class GRPOTrainer(Trainer):
                     "`pip install vllm` to use it."
                 )
 
-            if self.accelerator.is_main_process:
-                vllm_device = self.args.vllm_device
-                if vllm_device == "auto":
-                    if torch.cuda.device_count() == 1:
-                        vllm_device = "cuda:0"  # particular case when training with onyl 1 GPU: share it
-                    else:
-                        vllm_device = f"cuda:{self.accelerator.num_processes}"  # take the next GPU idx
-                # Check that the requested device is available
-                if vllm_device.split(":")[0] == "cuda" and int(vllm_device.split(":")[1]) >= torch.cuda.device_count():
-                    raise ValueError(
-                        f"The requested device for vllm ({vllm_device}) is not available. You are likely using vLLM "
-                        "without restricting the number of GPUs for training. Set the `--num_processes` argument to a "
-                        "value lower than the number of GPUs available on your machine—typically, reducing it by one "
-                        f"is sufficient. In your case: `--num_processes {torch.cuda.device_count() - 1}`."
-                    )
-                # Check that the requested device is not also used for training
-                if vllm_device in {f"cuda:{idx}" for idx in range(self.accelerator.num_processes)}:
-                    warnings.warn(
-                        f"The requested device {vllm_device} is also being used for training. For higher throughput "
-                        "and to avoid out-of-memory errors, it is recommended to use a dedicated device for vLLM. "
-                        "If this is intentional, you may ignore this warning but should adjust "
-                        "`vllm_gpu_memory_utilization` accordingly."
-                    )
+            self.vllm_device_manager = VLLMDeviceManager(
+                self.accelerator, self.args.vllm_device
+            )
+
+            if self.vllm_device_manager.is_vllm_process:
+
                 # vLLM is not compatible with accelerate. So we need to patch it to make sure we can (1) place the vLLM
                 # model on the desired device (world_size_patch) and (2) avoid a test that is not designed for our
                 # setting (profiling_patch).
-                world_size_patch = patch("torch.distributed.get_world_size", return_value=1)
+                world_size_patch = patch(
+                    "torch.distributed.get_world_size", 
+                    return_value=self.vllm_device_manager.tensor_parallel,
+                )
                 profiling_patch = patch(
                     "vllm.worker.worker.Worker._assert_memory_footprint_increased_during_profiling", return_value=None
                 )
-                with world_size_patch, profiling_patch:
+                # these are used to pass through the dist groups
+                # - dont really understand how VLLM manages the processs
+                #   groups
+                group_patch1 = patch(
+                    "vllm.distributed.parallel_state.init_world_group",
+                    build_init_world_group([
+                        torch.distributed.get_rank()
+                    ], _init_world_group)
+                )
+                group_patch2 = patch(
+                    "vllm.distributed.parallel_state.init_model_parallel_group",
+                    build_init_world_group([[
+                        torch.distributed.get_rank()
+                    ]], _init_model_parallel_group)
+                )
+                with world_size_patch, group_patch1, group_patch2, profiling_patch:
                     self.llm = LLM(
                         model=model.name_or_path,
-                        device=vllm_device,
+                        device=f'cuda:{self.vllm_device_manager.vllm_device}',
                         gpu_memory_utilization=self.args.vllm_gpu_memory_utilization,
                         dtype=self.args.vllm_dtype,
                         # Automatic Prefix Caching caches the KV cache of existing queries, so that a new query can
@@ -417,7 +498,8 @@ class GRPOTrainer(Trainer):
                         max_model_len=self.args.vllm_max_model_len,
                         hf_overrides = {
                             'max_position_embeddings': self.max_prompt_length + self.max_completion_length
-                        }
+                        },
+                        enforce_eager=True, # DEBUG
                     )
                 self.sampling_params = SamplingParams(
                     temperature=args.temperature,
@@ -550,11 +632,12 @@ class GRPOTrainer(Trainer):
 
             # Generate completions using vLLM: gather all prompts and use them in a single call in the main process
             all_prompts_text = gather_object(prompts_text)
-            if self.accelerator.is_main_process:
+            if self.vllm_device_manager.is_vllm_process:
                 outputs = self.llm.generate(all_prompts_text, sampling_params=self.sampling_params, use_tqdm=False)
                 completion_ids = [out.token_ids for completions in outputs for out in completions.outputs]
             else:
                 completion_ids = [None] * len(all_prompts_text)
+
             # Broadcast the completions from the main process to all processes, ensuring each process receives its
             # corresponding slice.
             completion_ids = broadcast_object_list(completion_ids, from_process=0)
