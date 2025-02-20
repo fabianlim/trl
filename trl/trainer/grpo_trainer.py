@@ -127,17 +127,20 @@ class VLLMDeviceManager:
 
         # detect if we want sharding
         # new format auto:<SHARD>:<TP>
-        self.mini_shards = 1
+        self.mini_shards = 2
         self.tensor_parallel = 1
 
         # get the local world size
         # https://pytorch.org/docs/stable/elastic/run.html#environment-variables
         self.local_world_size = int(os.environ["LOCAL_WORLD_SIZE"])
+        assert self.local_world_size % self.mini_shards == 0, "number of mini shards must divide local world size"
         self.mini_shard_size = self.local_world_size // self.mini_shards
 
         # NOTE: some draft code
-        # if vllm_device.startswith("auto:"):
-        #     vllm_device, self.mini_shards, self.tensor_parallel = vllm_device.split(":")
+        if vllm_device.startswith("auto:"):
+            _,  self.mini_shards, self.tensor_parallel = vllm_device.split(":")
+            self.mini_shards = int(self.mini_shards)
+            self.tensor_parallel = int(self.tensor_parallel)
 
         # NOTE: disable these checks first. until finalize how to handle the distributed devices
         # vllm_device = self.args.vllm_device
@@ -176,9 +179,6 @@ class VLLMDeviceManager:
         
     @property
     def is_vllm_process(self):
-        # if self.mini_shards == 1:
-        #     return self.accelerator.is_local_main_process
-        # return self.accelerator.local_process_index % self.mini_shard_size == 0
         return self.rank_within_mini_shard == 0
 
     # @property
@@ -197,10 +197,10 @@ class VLLMDeviceManager:
 
     @property
     def vllm_device(self):
-        # for now the vllm will occupy the GPU at the end of the local
-        # island
+        # NOTE: cannot handle TP for now
+        local_mini_shard = self.accelerator.local_process_index // self.mini_shard_size
         # FIXME: this one is to be changed when we consider TP and local shards
-        return self.local_world_size
+        return self.local_world_size + local_mini_shard
 
     @property
     def rank_within_mini_shard(self):
