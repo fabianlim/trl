@@ -231,6 +231,62 @@ class VLLMDeviceManager:
         torch.distributed.all_gather_into_tensor(output_tensors, tensor, group=self._group)
         return output_tensors.view(-1, *tensor.size()[1:])
 
+    def gather_tensors(self, object):
+        # this follows accelerate.utils.operations.gather_object, which is an all 
+        # gather operation, used to implement the gather op here.
+        output_objects = [None for _ in range(self.mini_shard_size)]
+        device = f'cuda:{self.accelerator.process_index}'
+        output_objects = [
+            torch.empty(100, dtype=torch.int, device=device) 
+            for _ in range(self.mini_shard_size)
+    ]
+
+        print ("rank", self.accelerator.process_index, "before barrier")
+        torch.distributed.barrier(
+            group=self._group, device_ids=[self.accelerator.process_index]
+        )
+
+        # print ("rank", self.accelerator.process_index, "after barrier")
+        # device = f'cuda:{self.accelerator.process_index}'
+        # input_slice = torch.zeros(1).cuda(device)
+        # output = torch.zeros(3).cuda(device)
+        # torch.distributed.all_gather_into_tensor(output, input_slice, group=self._group)
+        # print ("rank", self.accelerator.process_index, "after dummy gather")
+        mini_shard = self.accelerator.process_index // self.mini_shard_size
+        torch.distributed.gather(
+            torch.randint(
+                1000, (100,), device=device,
+                dtype=torch.int,
+            ),
+            (
+                output_objects if 
+                self.accelerator.process_index == mini_shard * self.mini_shard_size 
+                else None
+            ),  
+            group=self._group, 
+            dst=mini_shard * self.mini_shard_size
+        )
+
+        # torch.distributed.all_gather_object(output_objects, object, group=self._group)
+        # torch.distributed.all_gather_object(output_objects, ['hello'], group=self._group)
+        # mini_shard = self.accelerator.process_index // self.mini_shard_size
+        # torch.distributed.gather_object(
+        #     ['hello'], 
+        #     (
+        #         output_objects if 
+        #         self.accelerator.process_index == mini_shard * self.mini_shard_size 
+        #         else None
+        #     ),  
+        #     group=self._group, 
+        #     dst=mini_shard * self.mini_shard_size
+        # )
+        if self.accelerator.process_index == 3:
+            print (output_objects[0].sum())
+        # return [x for y in output_objects for x in y]
+        # return ['test' for y in output_objects for x in y]
+        item = '<|im_start|>system\nA conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant first thinks about the reasoning process in the mind and then provides the user with the answer. The reasoning process is enclosed within <think> </think> and the answer is given in the \\boxed environment, respectively, i.e., <think> reasoning process here </think> \\boxed{answer here}.<|im_end|>\n<|im_start|>user\nLet $\\omega = \\cos\\frac{2\\pi}{7} + i \\cdot \\sin\\frac{2\\pi}{7},$ where $i = \\sqrt{-1}.$ Find the value of the product \\[\\prod_{k=0}^6 \\left(\\omega^{3k} + \\omega^k + 1\\right).\\]<|im_end|>\n<|im_start|>assistant\nLet me solve this step by step.\n<think>', '<|im_start|>system\nA conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant first thinks about the reasoning process in the mind and then provides the user with the answer. The reasoning process is enclosed within <think> </think> and the answer is given in the \\boxed environment, respectively, i.e., <think> reasoning process here </think> \\boxed{answer here}.<|im_end|>\n<|im_start|>user\nLet $\\omega = \\cos\\frac{2\\pi}{7} + i \\cdot \\sin\\frac{2\\pi}{7},$ where $i = \\sqrt{-1}.$ Find the value of the product \\[\\prod_{k=0}^6 \\left(\\omega^{3k} + \\omega^k + 1\\right).\\]<|im_end|>\n<|im_start|>assistant\nLet me solve this step by step.\n<think>', '<|im_start|>system\nA conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant first thinks about the reasoning process in the mind and then provides the user with the answer. The reasoning process is enclosed within <think> </think> and the answer is given in the \\boxed environment, respectively, i.e., <think> reasoning process here </think> \\boxed{answer here}.<|im_end|>\n<|im_start|>user\nLet $\\omega = \\cos\\frac{2\\pi}{7} + i \\cdot \\sin\\frac{2\\pi}{7},$ where $i = \\sqrt{-1}.$ Find the value of the product \\[\\prod_{k=0}^6 \\left(\\omega^{3k} + \\omega^k + 1\\right).\\]<|im_end|>\n<|im_start|>assistant\nLet me solve this step by step.\n<think>', '<|im_start|>system\nA conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant first thinks about the reasoning process in the mind and then provides the user with the answer. The reasoning process is enclosed within <think> </think> and the answer is given in the \\boxed environment, respectively, i.e., <think> reasoning process here </think> \\boxed{answer here}.<|im_end|>\n<|im_start|>user\nLet $\\omega = \\cos\\frac{2\\pi}{7} + i \\cdot \\sin\\frac{2\\pi}{7},$ where $i = \\sqrt{-1}.$ Find the value of the product \\[\\prod_{k=0}^6 \\left(\\omega^{3k} + \\omega^k + 1\\right).\\]<|im_end|>\n<|im_start|>assistant\nLet me solve this step by step.\n<think>'
+        return [item for _ in range(self.mini_shard_size)]
+
     # depracated in favour of scattering
     # def broadcast_object_list(self, object_list, device=None):
     #     # shard_main_process_rank = self.vllm_shard_rank * self.mini_shard_size
