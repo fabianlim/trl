@@ -163,15 +163,31 @@ class VLLMDeviceManager:
         #         "`vllm_gpu_memory_utilization` accordingly."
         #     )
         
+        # create a distributed group for communication on its mini-shard
+
+        mini_shard = torch.distributed.get_rank() // self.mini_shard_size
+        self._group = torch.distributed.new_group(
+            range(
+                mini_shard * self.mini_shard_size, 
+                (mini_shard+1) * self.mini_shard_size, 
+            ),
+            backend='nccl', # assume this is the case
+        )
+        
     @property
     def is_vllm_process(self):
-        if self.mini_shards == 1:
-            return self.accelerator.is_local_main_process
-        return self.accelerator.local_process_index % self.mini_shard_size == 0
+        # if self.mini_shards == 1:
+        #     return self.accelerator.is_local_main_process
+        # return self.accelerator.local_process_index % self.mini_shard_size == 0
+        return self.rank_within_mini_shard == 0
 
-    @property
-    def vllm_shard_rank(self):
-        return self.accelerator.local_process_index // self.mini_shard_size
+    # @property
+    # def vllm_shard_rank(self):
+    #     return self.accelerator.local_process_index // self.mini_shard_size
+
+    # @property
+    # def vllm_shard_main_process_rank(self):
+    #     return self.vllm_shard_rank * self.mini_shard_size
     
     # NOTE: some draft code
     # @property
@@ -183,7 +199,38 @@ class VLLMDeviceManager:
     def vllm_device(self):
         # for now the vllm will occupy the GPU at the end of the local
         # island
+        # FIXME: this one is to be changed when we consider TP and local shards
         return self.local_world_size
+
+    @property
+    def rank_within_mini_shard(self):
+        return self.accelerator.process_index % self.mini_shard_size
+
+    # def distributed_group(self):
+    #     return self._group
+
+    def gather_object(self, object):
+        output_objects = [None for _ in range(self.mini_shard_size)]
+        torch.distributed.all_gather_object(output_objects, object, group=self._group)
+        return [x for y in output_objects for x in y]
+
+    def gather(self, tensor):
+        output_tensors = torch.empty(
+            self.mini_shard_size * tensor.numel(),
+            dtype=tensor.dtype,
+            device=tensor.device,
+        )
+        torch.distributed.all_gather_into_tensor(output_tensors, tensor, group=self._group)
+        return output_tensors.view(-1, *tensor.size()[1:])
+
+    def broadcast_object_list(self, object_list, device=None):
+        # shard_main_process_rank = self.vllm_shard_rank * self.mini_shard_size
+        mini_shard = torch.distributed.get_rank() // self.mini_shard_size
+        torch.distributed.broadcast_object_list(
+            object_list, src=mini_shard*self.mini_shard_size,
+            group=self._group
+        )
+        return object_list
 # 
 class GRPOTrainer(Trainer):
     """
@@ -454,9 +501,16 @@ class GRPOTrainer(Trainer):
                     "`pip install vllm` to use it."
                 )
 
+            # FIXME: we need to check the generations number
+
             self.vllm_device_manager = VLLMDeviceManager(
                 self.accelerator, self.args.vllm_device
             )
+
+            assert (
+                (self.vllm_device_manager.mini_shard_size * args.per_device_train_batch_size) 
+                % self.num_generations == 0
+            ), "generations must devide mini_shard_size * per device batch size "
 
             if self.vllm_device_manager.is_vllm_process:
 
@@ -631,7 +685,9 @@ class GRPOTrainer(Trainer):
                 self._last_loaded_step = self.state.global_step
 
             # Generate completions using vLLM: gather all prompts and use them in a single call in the main process
-            all_prompts_text = gather_object(prompts_text)
+            # all_prompts_text = gather_object(prompts_text)
+            self.accelerator.wait_for_everyone()
+            all_prompts_text = self.vllm_device_manager.gather_object(prompts_text)
             if self.vllm_device_manager.is_vllm_process:
                 outputs = self.llm.generate(all_prompts_text, sampling_params=self.sampling_params, use_tqdm=False)
                 completion_ids = [out.token_ids for completions in outputs for out in completions.outputs]
@@ -640,10 +696,12 @@ class GRPOTrainer(Trainer):
 
             # Broadcast the completions from the main process to all processes, ensuring each process receives its
             # corresponding slice.
-            completion_ids = broadcast_object_list(completion_ids, from_process=0)
+            self.accelerator.wait_for_everyone()
+            completion_ids = self.vllm_device_manager.broadcast_object_list(completion_ids)
+            process_index = self.vllm_device_manager.rank_within_mini_shard
             process_slice = slice(
-                self.accelerator.process_index * len(prompts),
-                (self.accelerator.process_index + 1) * len(prompts),
+                process_index * len(prompts),
+                (process_index + 1) * len(prompts),
             )
             completion_ids = completion_ids[process_slice]
 
@@ -721,7 +779,11 @@ class GRPOTrainer(Trainer):
 
         # Gather the reward per function: this part is crucial, because the rewards are normalized per group and the
         # completions may be distributed across processes
-        rewards_per_func = gather(rewards_per_func)
+        if self.args.use_vllm:
+            self.accelerator.wait_for_everyone()
+            rewards_per_func = self.vllm_device_manager.gather(rewards_per_func)
+        else:
+            rewards_per_func = gather(rewards_per_func)
 
         # Apply weights to each reward function's output and sum
         rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).sum(dim=1)
@@ -735,10 +797,15 @@ class GRPOTrainer(Trainer):
         std_grouped_rewards = std_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
         advantages = (rewards - mean_grouped_rewards) / (std_grouped_rewards + 1e-4)
 
+        if self.args.use_vllm:
+            process_index = self.vllm_device_manager.rank_within_mini_shard
+        else:
+            process_index = self.accelerator.process_index
+
         # Slice to keep only the local part of the data
         process_slice = slice(
-            self.accelerator.process_index * len(prompts),
-            (self.accelerator.process_index + 1) * len(prompts),
+            process_index * len(prompts),
+            (process_index + 1) * len(prompts),
         )
         advantages = advantages[process_slice]
 
