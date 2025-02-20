@@ -127,20 +127,21 @@ class VLLMDeviceManager:
 
         # detect if we want sharding
         # new format auto:<SHARD>:<TP>
-        self.mini_shards = 2
+        self.mini_shards = 1
         self.tensor_parallel = 1
 
         # get the local world size
         # https://pytorch.org/docs/stable/elastic/run.html#environment-variables
         self.local_world_size = int(os.environ["LOCAL_WORLD_SIZE"])
         assert self.local_world_size % self.mini_shards == 0, "number of mini shards must divide local world size"
-        self.mini_shard_size = self.local_world_size // self.mini_shards
 
         # NOTE: some draft code
         if vllm_device.startswith("auto:"):
             _,  self.mini_shards, self.tensor_parallel = vllm_device.split(":")
             self.mini_shards = int(self.mini_shards)
             self.tensor_parallel = int(self.tensor_parallel)
+
+        self.mini_shard_size = self.local_world_size // self.mini_shards
 
         # NOTE: disable these checks first. until finalize how to handle the distributed devices
         # vllm_device = self.args.vllm_device
@@ -168,13 +169,12 @@ class VLLMDeviceManager:
         
         # create a distributed group for communication on its mini-shard
 
-        mini_shard = torch.distributed.get_rank() // self.mini_shard_size
-        self._group = torch.distributed.new_group(
-            range(
-                mini_shard * self.mini_shard_size, 
-                (mini_shard+1) * self.mini_shard_size, 
-            ),
-            backend='nccl', # assume this is the case
+        world_size = torch.distributed.get_world_size()
+        self._group, subgroups  = torch.distributed.new_subgroups_by_enumeration(
+            [
+                list(range(i*self.mini_shard_size, (i+1) * self.mini_shard_size)) 
+                for i in range(world_size // self.mini_shard_size)
+            ]
         )
         
     @property
@@ -213,6 +213,7 @@ class VLLMDeviceManager:
         # this follows accelerate.utils.operations.gather_object, which is an all 
         # gather operation, used to implement the gather op here.
         output_objects = [None for _ in range(self.mini_shard_size)]
+
         torch.distributed.all_gather_object(output_objects, object, group=self._group)
         return [x for y in output_objects for x in y]
 
@@ -223,6 +224,9 @@ class VLLMDeviceManager:
             self.mini_shard_size * tensor.numel(),
             dtype=tensor.dtype,
             device=tensor.device,
+        )
+        torch.distributed.barrier(
+            group=self._group, device_ids=[self.accelerator.process_index]
         )
         torch.distributed.all_gather_into_tensor(output_tensors, tensor, group=self._group)
         return output_tensors.view(-1, *tensor.size()[1:])
@@ -239,13 +243,21 @@ class VLLMDeviceManager:
 
     def scatter_object_list(self, object_list, device=None):
 
-        mini_shard = torch.distributed.get_rank() // self.mini_shard_size
+        # mini_shard = torch.distributed.get_rank() // self.mini_shard_size
+        mini_shard = self.accelerator.process_index // self.mini_shard_size
         scatter_object_output_list = [None]
+        # barrier_tensor = torch.zeros(1).cuda()
+        # torch.distributed.all_reduce(barrier_tensor, group=self._group)
+
+        torch.distributed.barrier(
+            group=self._group, device_ids=[self.accelerator.process_index]
+        )
         torch.distributed.scatter_object_list(
             scatter_object_output_list, object_list, 
             src=mini_shard*self.mini_shard_size,
             group=self._group
         )
+        # torch.cuda.synchronize()
         return scatter_object_output_list
 # 
 class GRPOTrainer(Trainer):
@@ -701,7 +713,6 @@ class GRPOTrainer(Trainer):
                 self._last_loaded_step = self.state.global_step
 
             # Generate completions using vLLM: gather all prompts and use them in a single call in the main process
-            self.accelerator.wait_for_everyone() # somehow required for groups with subset of ranks
             all_prompts_text = self.vllm_device_manager.gather_object(prompts_text)
             if self.vllm_device_manager.is_vllm_process:
                 outputs = self.llm.generate(all_prompts_text, sampling_params=self.sampling_params, use_tqdm=False)
@@ -715,7 +726,6 @@ class GRPOTrainer(Trainer):
 
             # Broadcast the completions from the main process to all processes, ensuring each process receives its
             # corresponding slice.
-            self.accelerator.wait_for_everyone()
             completion_ids = self.vllm_device_manager.scatter_object_list(completion_ids)
             completion_ids = completion_ids[0]
 
@@ -794,7 +804,6 @@ class GRPOTrainer(Trainer):
         # Gather the reward per function: this part is crucial, because the rewards are normalized per group and the
         # completions may be distributed across processes
         if self.args.use_vllm:
-            self.accelerator.wait_for_everyone()
             rewards_per_func = self.vllm_device_manager.gather(rewards_per_func)
         else:
             rewards_per_func = gather(rewards_per_func)
