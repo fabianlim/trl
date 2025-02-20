@@ -210,11 +210,15 @@ class VLLMDeviceManager:
     #     return self._group
 
     def gather_object(self, object):
+        # this follows accelerate.utils.operations.gather_object, which is an all 
+        # gather operation, used to implement the gather op here.
         output_objects = [None for _ in range(self.mini_shard_size)]
         torch.distributed.all_gather_object(output_objects, object, group=self._group)
         return [x for y in output_objects for x in y]
 
     def gather(self, tensor):
+        # this follows accelerate.utils.operations.gather, which is an all 
+        # gather operation, used to implement the gather op here.
         output_tensors = torch.empty(
             self.mini_shard_size * tensor.numel(),
             dtype=tensor.dtype,
@@ -223,14 +227,26 @@ class VLLMDeviceManager:
         torch.distributed.all_gather_into_tensor(output_tensors, tensor, group=self._group)
         return output_tensors.view(-1, *tensor.size()[1:])
 
-    def broadcast_object_list(self, object_list, device=None):
-        # shard_main_process_rank = self.vllm_shard_rank * self.mini_shard_size
+    # depracated in favour of scattering
+    # def broadcast_object_list(self, object_list, device=None):
+    #     # shard_main_process_rank = self.vllm_shard_rank * self.mini_shard_size
+    #     mini_shard = torch.distributed.get_rank() // self.mini_shard_size
+    #     torch.distributed.broadcast_object_list(
+    #         object_list, src=mini_shard*self.mini_shard_size,
+    #         group=self._group
+    #     )
+    #     return object_list
+
+    def scatter_object_list(self, object_list, device=None):
+
         mini_shard = torch.distributed.get_rank() // self.mini_shard_size
-        torch.distributed.broadcast_object_list(
-            object_list, src=mini_shard*self.mini_shard_size,
+        scatter_object_output_list = [None]
+        torch.distributed.scatter_object_list(
+            scatter_object_output_list, object_list, 
+            src=mini_shard*self.mini_shard_size,
             group=self._group
         )
-        return object_list
+        return scatter_object_output_list
 # 
 class GRPOTrainer(Trainer):
     """
@@ -685,25 +701,23 @@ class GRPOTrainer(Trainer):
                 self._last_loaded_step = self.state.global_step
 
             # Generate completions using vLLM: gather all prompts and use them in a single call in the main process
-            # all_prompts_text = gather_object(prompts_text)
-            self.accelerator.wait_for_everyone()
+            self.accelerator.wait_for_everyone() # somehow required for groups with subset of ranks
             all_prompts_text = self.vllm_device_manager.gather_object(prompts_text)
             if self.vllm_device_manager.is_vllm_process:
                 outputs = self.llm.generate(all_prompts_text, sampling_params=self.sampling_params, use_tqdm=False)
                 completion_ids = [out.token_ids for completions in outputs for out in completions.outputs]
+                completion_ids = [
+                    completion_ids[i * len(prompts):(i+1) * len(prompts)] 
+                    for i in range(len(completion_ids) // len(prompts))
+                ]
             else:
-                completion_ids = [None] * len(all_prompts_text)
+                completion_ids = None
 
             # Broadcast the completions from the main process to all processes, ensuring each process receives its
             # corresponding slice.
             self.accelerator.wait_for_everyone()
-            completion_ids = self.vllm_device_manager.broadcast_object_list(completion_ids)
-            process_index = self.vllm_device_manager.rank_within_mini_shard
-            process_slice = slice(
-                process_index * len(prompts),
-                (process_index + 1) * len(prompts),
-            )
-            completion_ids = completion_ids[process_slice]
+            completion_ids = self.vllm_device_manager.scatter_object_list(completion_ids)
+            completion_ids = completion_ids[0]
 
             # Pad the completions, and concatenate them with the prompts
             completion_ids = [torch.tensor(ids, device=device) for ids in completion_ids]
