@@ -133,7 +133,7 @@ class VLLMDeviceManager:
         self.tensor_parallel = 1
         self.process_index = process_index
         self.local_process_index = local_process_index
-        self.device = f'cuda:{process_index}'
+        self.device = f'cuda:{local_process_index}'
 
         # get the local world size
         # https://pytorch.org/docs/stable/elastic/run.html#environment-variables
@@ -224,7 +224,7 @@ class VLLMDeviceManager:
 
     def _group_barrier(self):
         torch.distributed.barrier(
-            group=self._group, device_ids=[self.process_index]
+            group=self._group, device_ids=[self.local_process_index]
         )
 
     def gather_tensor_list(self, tensors: List[torch.tensor]):
@@ -826,7 +826,8 @@ class GRPOTrainer(Trainer):
                 outputs = self.llm.generate(
                     prompt_token_ids=[x.tolist() for x in all_prompts_ids], 
                     sampling_params=self.sampling_params, 
-                    use_tqdm=self.accelerator.is_local_main_process
+                    use_tqdm=False,
+                    # use_tqdm=self.accelerator.is_local_main_process
                     # use_tqdm=self.accelerator.process_index == 3
                 )
                 completion_ids = [
