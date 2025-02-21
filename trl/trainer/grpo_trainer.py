@@ -117,18 +117,23 @@ from vllm.distributed.parallel_state import (
 )
 
 # To be used if VLLM is generating 
+from typing import List
 class VLLMDeviceManager:
 
     def __init__(
-        self, accelerator: Accelerator,
+        self, 
+        process_index: int,
+        local_process_index: int,
         vllm_device: str,
     ):
-        self.accelerator = accelerator
 
         # detect if we want sharding
         # new format auto:<SHARD>:<TP>
         self.mini_shards = 1
         self.tensor_parallel = 1
+        self.process_index = process_index
+        self.local_process_index = local_process_index
+        self.device = f'cuda:{process_index}'
 
         # get the local world size
         # https://pytorch.org/docs/stable/elastic/run.html#environment-variables
@@ -176,46 +181,6 @@ class VLLMDeviceManager:
                 for i in range(world_size // self.mini_shard_size)
             ]
         )
-        
-    @property
-    def is_vllm_process(self):
-        return self.rank_within_mini_shard == 0
-
-    # @property
-    # def vllm_shard_rank(self):
-    #     return self.accelerator.local_process_index // self.mini_shard_size
-
-    # @property
-    # def vllm_shard_main_process_rank(self):
-    #     return self.vllm_shard_rank * self.mini_shard_size
-    
-    # NOTE: some draft code
-    # @property
-    # def vllm_device(self):
-    #     sz = self.local_world_size + self.vllm_shard_rank * self.tensor_parallel
-    #     return [sz + i for i in range(self.tensor_parallel)]
-
-    @property
-    def vllm_device(self):
-        # NOTE: cannot handle TP for now
-        local_mini_shard = self.accelerator.local_process_index // self.mini_shard_size
-        # FIXME: this one is to be changed when we consider TP and local shards
-        return self.local_world_size + local_mini_shard
-
-    @property
-    def rank_within_mini_shard(self):
-        return self.accelerator.process_index % self.mini_shard_size
-
-    # def distributed_group(self):
-    #     return self._group
-
-    def gather_object(self, object):
-        # this follows accelerate.utils.operations.gather_object, which is an all 
-        # gather operation, used to implement the gather op here.
-        output_objects = [None for _ in range(self.mini_shard_size)]
-
-        torch.distributed.all_gather_object(output_objects, object, group=self._group)
-        return [x for y in output_objects for x in y]
 
     def gather(self, tensor):
         # this follows accelerate.utils.operations.gather, which is an all 
@@ -225,97 +190,177 @@ class VLLMDeviceManager:
             dtype=tensor.dtype,
             device=tensor.device,
         )
-        torch.distributed.barrier(
-            group=self._group, device_ids=[self.accelerator.process_index]
-        )
+        self._group_barrier()
         torch.distributed.all_gather_into_tensor(output_tensors, tensor, group=self._group)
         return output_tensors.view(-1, *tensor.size()[1:])
 
-    def gather_tensors(self, object):
-        # this follows accelerate.utils.operations.gather_object, which is an all 
-        # gather operation, used to implement the gather op here.
-        output_objects = [None for _ in range(self.mini_shard_size)]
-        device = f'cuda:{self.accelerator.process_index}'
+    @property
+    def is_vllm_process(self):
+        # essentially this is the mini shard leader
+        return self.is_shard_leader
+
+    @property
+    def vllm_device(self):
+        # NOTE: cannot handle TP for now
+        # this indexes into the mini-shard local to the node
+        local_mini_shard_index = self.local_process_index // self.mini_shard_size
+        # FIXME: this one is to be changed when we consider TP and local shards
+        return self.local_world_size + local_mini_shard_index
+
+    @property
+    def local_rank_mini_shard(self):
+        # rank of this process within its mini shard
+        return self.process_index % self.mini_shard_size
+
+    @property
+    def is_shard_leader(self):
+        return self.local_rank_mini_shard == 0
+
+    @property
+    def global_rank_shard_leader(self):
+        # the global rank of the shard leader
+        mini_shard_idx = self.process_index // self.mini_shard_size
+        return mini_shard_idx * self.mini_shard_size
+
+    def _group_barrier(self):
+        torch.distributed.barrier(
+            group=self._group, device_ids=[self.process_index]
+        )
+
+    def gather_tensor_list(self, tensors: List[torch.tensor]):
+
+        batch = len(tensors)
+        assert batch > 0, "cannot gather empty tensor list"
+        dtype = tensors[0].dtype
+
+        # assume they are all the same dtype
+        # dtype = tensors[0].dtype
+
+        # assume the tensors are 1-D
+        sizes = torch.tensor(
+            [tensors[i].shape[-1] for i in range(len(tensors))],
+            dtype=torch.int32, device=self.device
+        )
+
+        # get a single tensor
+        self._group_barrier()
+        gathered_sizes = self.gather(sizes)
+
+        # for all_gather
         output_objects = [
-            torch.empty(100, dtype=torch.int, device=device) 
-            for _ in range(self.mini_shard_size)
-    ]
+            torch.empty(
+                gathered_sizes[i*batch:(i+1)*batch].sum(),
+                dtype=dtype, device=self.device
+            )
+            for i in range(self.mini_shard_size)
+        ]
 
-        print ("rank", self.accelerator.process_index, "before barrier")
-        torch.distributed.barrier(
-            group=self._group, device_ids=[self.accelerator.process_index]
-        )
-
-        # print ("rank", self.accelerator.process_index, "after barrier")
-        # device = f'cuda:{self.accelerator.process_index}'
-        # input_slice = torch.zeros(1).cuda(device)
-        # output = torch.zeros(3).cuda(device)
-        # torch.distributed.all_gather_into_tensor(output, input_slice, group=self._group)
-        # print ("rank", self.accelerator.process_index, "after dummy gather")
-        mini_shard = self.accelerator.process_index // self.mini_shard_size
-        torch.distributed.gather(
-            torch.randint(
-                1000, (100,), device=device,
-                dtype=torch.int,
-            ),
-            (
-                output_objects if 
-                self.accelerator.process_index == mini_shard * self.mini_shard_size 
-                else None
-            ),  
+        # have to use gather because we cannot gaurantee
+        # all tensors are of equal length
+        self._group_barrier()
+        torch.distributed.all_gather(
+            output_objects,
+            torch.cat(tensors), # form batch into single tensor
             group=self._group, 
-            dst=mini_shard * self.mini_shard_size
         )
 
-        # torch.distributed.all_gather_object(output_objects, object, group=self._group)
-        # torch.distributed.all_gather_object(output_objects, ['hello'], group=self._group)
-        # mini_shard = self.accelerator.process_index // self.mini_shard_size
-        # torch.distributed.gather_object(
-        #     ['hello'], 
-        #     (
-        #         output_objects if 
-        #         self.accelerator.process_index == mini_shard * self.mini_shard_size 
-        #         else None
-        #     ),  
-        #     group=self._group, 
-        #     dst=mini_shard * self.mini_shard_size
-        # )
-        if self.accelerator.process_index == 3:
-            print (output_objects[0].sum())
-        # return [x for y in output_objects for x in y]
-        # return ['test' for y in output_objects for x in y]
-        item = '<|im_start|>system\nA conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant first thinks about the reasoning process in the mind and then provides the user with the answer. The reasoning process is enclosed within <think> </think> and the answer is given in the \\boxed environment, respectively, i.e., <think> reasoning process here </think> \\boxed{answer here}.<|im_end|>\n<|im_start|>user\nLet $\\omega = \\cos\\frac{2\\pi}{7} + i \\cdot \\sin\\frac{2\\pi}{7},$ where $i = \\sqrt{-1}.$ Find the value of the product \\[\\prod_{k=0}^6 \\left(\\omega^{3k} + \\omega^k + 1\\right).\\]<|im_end|>\n<|im_start|>assistant\nLet me solve this step by step.\n<think>', '<|im_start|>system\nA conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant first thinks about the reasoning process in the mind and then provides the user with the answer. The reasoning process is enclosed within <think> </think> and the answer is given in the \\boxed environment, respectively, i.e., <think> reasoning process here </think> \\boxed{answer here}.<|im_end|>\n<|im_start|>user\nLet $\\omega = \\cos\\frac{2\\pi}{7} + i \\cdot \\sin\\frac{2\\pi}{7},$ where $i = \\sqrt{-1}.$ Find the value of the product \\[\\prod_{k=0}^6 \\left(\\omega^{3k} + \\omega^k + 1\\right).\\]<|im_end|>\n<|im_start|>assistant\nLet me solve this step by step.\n<think>', '<|im_start|>system\nA conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant first thinks about the reasoning process in the mind and then provides the user with the answer. The reasoning process is enclosed within <think> </think> and the answer is given in the \\boxed environment, respectively, i.e., <think> reasoning process here </think> \\boxed{answer here}.<|im_end|>\n<|im_start|>user\nLet $\\omega = \\cos\\frac{2\\pi}{7} + i \\cdot \\sin\\frac{2\\pi}{7},$ where $i = \\sqrt{-1}.$ Find the value of the product \\[\\prod_{k=0}^6 \\left(\\omega^{3k} + \\omega^k + 1\\right).\\]<|im_end|>\n<|im_start|>assistant\nLet me solve this step by step.\n<think>', '<|im_start|>system\nA conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant first thinks about the reasoning process in the mind and then provides the user with the answer. The reasoning process is enclosed within <think> </think> and the answer is given in the \\boxed environment, respectively, i.e., <think> reasoning process here </think> \\boxed{answer here}.<|im_end|>\n<|im_start|>user\nLet $\\omega = \\cos\\frac{2\\pi}{7} + i \\cdot \\sin\\frac{2\\pi}{7},$ where $i = \\sqrt{-1}.$ Find the value of the product \\[\\prod_{k=0}^6 \\left(\\omega^{3k} + \\omega^k + 1\\right).\\]<|im_end|>\n<|im_start|>assistant\nLet me solve this step by step.\n<think>'
-        return [item for _ in range(self.mini_shard_size)]
+        # pretend like its a gather
+        if not self.is_shard_leader:
+            return None
 
-    # depracated in favour of scattering
-    # def broadcast_object_list(self, object_list, device=None):
-    #     # shard_main_process_rank = self.vllm_shard_rank * self.mini_shard_size
-    #     mini_shard = torch.distributed.get_rank() // self.mini_shard_size
-    #     torch.distributed.broadcast_object_list(
-    #         object_list, src=mini_shard*self.mini_shard_size,
-    #         group=self._group
-    #     )
-    #     return object_list
+        outputs = []
+        for i in range(self.mini_shard_size):
+            batch_sizes = gathered_sizes[i*batch:(i+1)*batch].tolist()
+            outputs.extend(torch.split(
+                output_objects[i], batch_sizes,
+            ))
+        return outputs
 
-    def scatter_object_list(self, object_list, device=None):
+    def scatter_tensor_list(
+        self, 
+        batch: int,
+        dtype,
+        tensors: List[torch.tensor] = None,
+    ):
 
-        # mini_shard = torch.distributed.get_rank() // self.mini_shard_size
-        mini_shard = self.accelerator.process_index // self.mini_shard_size
-        scatter_object_output_list = [None]
-        # barrier_tensor = torch.zeros(1).cuda()
-        # torch.distributed.all_reduce(barrier_tensor, group=self._group)
+        # assume all the ranks give the same batch size
 
-        torch.distributed.barrier(
-            group=self._group, device_ids=[self.accelerator.process_index]
+        if tensors is not None:
+            assert len(tensors) > 0, "cannot scatter empty tensor list"
+            assert self.is_shard_leader, "only the shard leader can scatte"
+
+            # assume the tensors are 1-D
+            sizes = torch.tensor(
+                [tensors[i].shape[-1] for i in range(len(tensors))],
+                dtype=torch.int32, device=self.device
+            )
+        else:
+
+            # need to broadcast the sizes
+            sizes = torch.empty(
+                batch * self.mini_shard_size, 
+                dtype=torch.int32, device=self.device
+            )
+
+        # get all the sizes
+        self._group_barrier()
+        torch.distributed.broadcast(
+            sizes,
+            group=self._group, 
+            src=self.global_rank_shard_leader,
         )
-        torch.distributed.scatter_object_list(
-            scatter_object_output_list, object_list, 
-            src=mini_shard*self.mini_shard_size,
-            group=self._group
+
+        # total number of tokens in one mini shard
+        scattered_sizes_list = sizes.view(-1, batch).sum(axis=-1)
+
+        # largest number of tokens in one rank of the mini shard
+        max_size = scattered_sizes_list.max().item()
+
+        # scatter tensor
+
+        scattered_tensor = torch.empty(
+            # scattered_sizes.sum(),
+            max_size,
+            dtype=dtype, device=self.device
         )
-        # torch.cuda.synchronize()
-        return scatter_object_output_list
-# 
+
+        # each rank will get a cat of its batch
+        scattered_tensor_list = None
+        if self.is_shard_leader:
+            scattered_tensor_list = []
+            for i in range(self.mini_shard_size):
+
+                # collect all the tokens in the batch
+                # of a rank in the minishard
+                ids = []
+                for j in range(batch):
+                    ids.extend(tensors[i*batch+j])
+
+                # pad it to make all same rank
+                ids.extend([0] * (max_size - len(ids)))
+                scattered_tensor_list.append(
+                    torch.tensor(ids, dtype=dtype, device=self.device)
+                )
+
+        # get max_size tokens of the rank
+        self._group_barrier()
+        torch.distributed.scatter(
+            scattered_tensor, scattered_tensor_list,
+            group=self._group, 
+            src=self.global_rank_shard_leader,
+        )
+
+        # get the number of tokens in this rank
+        r = self.local_rank_mini_shard
+        szs_sum = scattered_sizes_list[r]
+        szs = sizes[r*batch:(r+1)*batch].tolist()
+
+        # drop the padding and split
+        outputs = torch.split(
+            scattered_tensor[:szs_sum], szs
+        )
+        return outputs
+
 class GRPOTrainer(Trainer):
     """
     Trainer for the Group Relative Policy Optimization (GRPO) method. This algorithm was initially proposed in the
@@ -588,7 +633,9 @@ class GRPOTrainer(Trainer):
             # FIXME: we need to check the generations number
 
             self.vllm_device_manager = VLLMDeviceManager(
-                self.accelerator, self.args.vllm_device
+                process_index=self.accelerator.process_index, 
+                local_process_index=self.accelerator.local_process_index, 
+                vllm_device=self.args.vllm_device
             )
 
             assert (
@@ -637,7 +684,7 @@ class GRPOTrainer(Trainer):
                         hf_overrides = {
                             'max_position_embeddings': self.max_prompt_length + self.max_completion_length
                         },
-                        enforce_eager=True, # DEBUG
+                        # enforce_eager=True, # DEBUG
                     )
                 self.sampling_params = SamplingParams(
                     temperature=args.temperature,
@@ -769,24 +816,33 @@ class GRPOTrainer(Trainer):
                 self._last_loaded_step = self.state.global_step
 
             # Generate completions using vLLM: gather all prompts and use them in a single call in the main process
-            all_prompts_text = self.vllm_device_manager.gather_object(prompts_text)
-            if self.vllm_device_manager.is_vllm_process:
-                outputs = self.llm.generate(all_prompts_text, sampling_params=self.sampling_params, use_tqdm=False)
-                completion_ids = [out.token_ids for completions in outputs for out in completions.outputs]
+            # - for safety do a plain tokenization again
+            prompts_tokens = [
+                torch.tensor(x, dtype=torch.int32, device=device)
+                for x in self.processing_class(prompts_text)['input_ids']
+            ]
+            all_prompts_ids = self.vllm_device_manager.gather_tensor_list(prompts_tokens)
+            if self.vllm_device_manager.is_vllm_process:                                              
+                outputs = self.llm.generate(
+                    prompt_token_ids=[x.tolist() for x in all_prompts_ids], 
+                    sampling_params=self.sampling_params, 
+                    use_tqdm=self.accelerator.is_local_main_process
+                    # use_tqdm=self.accelerator.process_index == 3
+                )
                 completion_ids = [
-                    completion_ids[i * len(prompts):(i+1) * len(prompts)] 
-                    for i in range(len(completion_ids) // len(prompts))
+                    torch.tensor(out.token_ids, dtype=torch.int32, device=device)
+                    for completions in outputs for out in completions.outputs
                 ]
             else:
                 completion_ids = None
 
             # Broadcast the completions from the main process to all processes, ensuring each process receives its
             # corresponding slice.
-            completion_ids = self.vllm_device_manager.scatter_object_list(completion_ids)
-            completion_ids = completion_ids[0]
+            completion_ids = self.vllm_device_manager.scatter_tensor_list(
+                tensors=completion_ids, dtype=torch.int32, batch=len(prompts),
+            )
 
             # Pad the completions, and concatenate them with the prompts
-            completion_ids = [torch.tensor(ids, device=device) for ids in completion_ids]
             completion_ids = pad(completion_ids, padding_value=self.processing_class.pad_token_id)
             prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)
         else:
@@ -877,7 +933,7 @@ class GRPOTrainer(Trainer):
         advantages = (rewards - mean_grouped_rewards) / (std_grouped_rewards + 1e-4)
 
         if self.args.use_vllm:
-            process_index = self.vllm_device_manager.rank_within_mini_shard
+            process_index = self.vllm_device_manager.local_rank_mini_shard
         else:
             process_index = self.accelerator.process_index
 
