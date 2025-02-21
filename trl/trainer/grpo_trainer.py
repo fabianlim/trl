@@ -638,10 +638,6 @@ class GRPOTrainer(Trainer):
                 vllm_device=self.args.vllm_device
             )
 
-            assert (
-                (self.vllm_device_manager.mini_shard_size * args.per_device_train_batch_size) 
-                % self.num_generations == 0
-            ), "generations must devide mini_shard_size * per device batch size "
 
             if self.vllm_device_manager.is_vllm_process:
 
@@ -916,10 +912,7 @@ class GRPOTrainer(Trainer):
 
         # Gather the reward per function: this part is crucial, because the rewards are normalized per group and the
         # completions may be distributed across processes
-        if self.args.use_vllm:
-            rewards_per_func = self.vllm_device_manager.gather(rewards_per_func)
-        else:
-            rewards_per_func = gather(rewards_per_func)
+        rewards_per_func = gather(rewards_per_func)
 
         # Apply weights to each reward function's output and sum
         rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).sum(dim=1)
@@ -933,10 +926,7 @@ class GRPOTrainer(Trainer):
         std_grouped_rewards = std_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
         advantages = (rewards - mean_grouped_rewards) / (std_grouped_rewards + 1e-4)
 
-        if self.args.use_vllm:
-            process_index = self.vllm_device_manager.local_rank_mini_shard
-        else:
-            process_index = self.accelerator.process_index
+        process_index = self.accelerator.process_index
 
         # Slice to keep only the local part of the data
         process_slice = slice(
