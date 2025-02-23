@@ -654,22 +654,25 @@ class GRPOTrainer(Trainer):
                 # these are used to pass through the dist groups
                 # - dont really understand how VLLM manages the processs
                 #   groups
-                group_patch1 = patch(
-                    "vllm.distributed.parallel_state.init_world_group",
-                    build_init_world_group([
-                        torch.distributed.get_rank()
-                    ], _init_world_group)
-                )
-                group_patch2 = patch(
-                    "vllm.distributed.parallel_state.init_model_parallel_group",
-                    build_init_world_group([[
-                        torch.distributed.get_rank()
-                    ]], _init_model_parallel_group)
-                )
-                with world_size_patch, group_patch1, group_patch2, profiling_patch:
+                # group_patch1 = patch(
+                #     "vllm.distributed.parallel_state.init_world_group",
+                #     build_init_world_group([
+                #         torch.distributed.get_rank()
+                #     ], _init_world_group)
+                # )
+                # group_patch2 = patch(
+                #     "vllm.distributed.parallel_state.init_model_parallel_group",
+                #     build_init_world_group([[
+                #         torch.distributed.get_rank()
+                #     ]], _init_model_parallel_group)
+                # )
+                cuda_devices_patch = patch.dict('os.environ', {'CUDA_VISIBLE_DEVICES': '6,7'})
+                # with world_size_patch, group_patch1, group_patch2, profiling_patch:
+                with world_size_patch, cuda_devices_patch, profiling_patch:
                     self.llm = LLM(
                         model=model.name_or_path,
-                        device=f'cuda:{self.vllm_device_manager.vllm_device}',
+                        # device=f'cuda:{self.vllm_device_manager.vllm_device}',
+                        device='cuda',
                         gpu_memory_utilization=self.args.vllm_gpu_memory_utilization,
                         dtype=self.args.vllm_dtype,
                         # Automatic Prefix Caching caches the KV cache of existing queries, so that a new query can
