@@ -105,10 +105,10 @@ class RepeatRandomSampler(Sampler):
     def __len__(self):
         return self.num_samples * self.repeat_count
 
-def build_init_world_group(ranks, f):
+def build_init_world_group(global_ranks, local_rank, f):
     # hijack
-    def _wrapper(_, *args, **kwargs):
-        return f(ranks, *args, **kwargs)
+    def _wrapper(_, __, *args, **kwargs):
+        return f(global_ranks, local_rank, *args, **kwargs)
     return _wrapper
 
 from vllm.distributed.parallel_state import (
@@ -135,18 +135,15 @@ class VLLMDeviceManager:
         self.local_process_index = local_process_index
         self.device = f'cuda:{local_process_index}'
 
+        if vllm_device.startswith("tp:"):
+            self.tensor_parallel = vllm_device.split(":")
+            self.tensor_parallel = int(self.tensor_parallel)
+
         # get the local world size
         # https://pytorch.org/docs/stable/elastic/run.html#environment-variables
         self.local_world_size = int(os.environ["LOCAL_WORLD_SIZE"])
-        assert self.local_world_size % self.mini_shards == 0, "number of mini shards must divide local world size"
+        assert self.local_world_size % self.tensor_parallel == 0, "tp_degree must divide local world size"
 
-        # NOTE: some draft code
-        if vllm_device.startswith("auto:"):
-            _,  self.mini_shards, self.tensor_parallel = vllm_device.split(":")
-            self.mini_shards = int(self.mini_shards)
-            self.tensor_parallel = int(self.tensor_parallel)
-
-        self.mini_shard_size = self.local_world_size // self.mini_shards
 
         # NOTE: disable these checks first. until finalize how to handle the distributed devices
         # vllm_device = self.args.vllm_device
@@ -177,8 +174,8 @@ class VLLMDeviceManager:
         world_size = torch.distributed.get_world_size()
         self._group, subgroups  = torch.distributed.new_subgroups_by_enumeration(
             [
-                list(range(i*self.mini_shard_size, (i+1) * self.mini_shard_size)) 
-                for i in range(world_size // self.mini_shard_size)
+                list(range(i*self.tensor_parallel, (i+1) * self.tensor_parallel)) 
+                for i in range(world_size // self.tensor_parallel)
             ]
         )
 
@@ -210,7 +207,7 @@ class VLLMDeviceManager:
     @property
     def local_rank_mini_shard(self):
         # rank of this process within its mini shard
-        return self.process_index % self.mini_shard_size
+        return self.process_index % self.tensor_parallel
 
     @property
     def is_shard_leader(self):
@@ -222,12 +219,20 @@ class VLLMDeviceManager:
         mini_shard_idx = self.process_index // self.mini_shard_size
         return mini_shard_idx * self.mini_shard_size
 
+    def group_devices(self):
+        i = self.local_process_index  //  self.tensor_parallel
+        return list(range(i*self.tensor_parallel, (i+1)*self.tensor_parallel))
+
     def _group_barrier(self):
         torch.distributed.barrier(
             group=self._group, device_ids=[self.local_process_index]
         )
 
     def gather_tensor_list(self, tensors: List[torch.tensor]):
+
+        if self.tensor_parallel == 1:
+            # pass through
+            return tensors
 
         batch = len(tensors)
         assert batch > 0, "cannot gather empty tensor list"
@@ -252,7 +257,7 @@ class VLLMDeviceManager:
                 gathered_sizes[i*batch:(i+1)*batch].sum(),
                 dtype=dtype, device=self.device
             )
-            for i in range(self.mini_shard_size)
+            for i in range(self.tensor_parallel)
         ]
 
         # have to use gather because we cannot gaurantee
@@ -264,12 +269,8 @@ class VLLMDeviceManager:
             group=self._group, 
         )
 
-        # pretend like its a gather
-        if not self.is_shard_leader:
-            return None
-
         outputs = []
-        for i in range(self.mini_shard_size):
+        for i in range(self.tensor_parallel):
             batch_sizes = gathered_sizes[i*batch:(i+1)*batch].tolist()
             outputs.extend(torch.split(
                 output_objects[i], batch_sizes,
@@ -638,50 +639,50 @@ class GRPOTrainer(Trainer):
                 vllm_device=self.args.vllm_device
             )
 
+            world_size_patch = patch(
+                "torch.distributed.get_world_size", 
+                return_value=self.vllm_device_manager.tensor_parallel,
+            )
+            group_patch1 = patch(
+                "vllm.distributed.parallel_state.init_world_group",
+                build_init_world_group(
+                    self.vllm_device_manager.group_devices(),
+                    self.vllm_device_manager.local_process_index,
+                    _init_world_group
+                )
+            )
+            group_patch2 = patch(
+                "vllm.distributed.parallel_state.init_model_parallel_group",
+                build_init_world_group(
+                    [self.vllm_device_manager.group_devices()],
+                    self.vllm_device_manager.local_process_index,
+                    _init_model_parallel_group
+                )
+            )
 
-            if self.vllm_device_manager.is_vllm_process:
-
-                # vLLM is not compatible with accelerate. So we need to patch it to make sure we can (1) place the vLLM
-                # model on the desired device (world_size_patch) and (2) avoid a test that is not designed for our
-                # setting (profiling_patch).
-                world_size_patch = patch(
-                    "torch.distributed.get_world_size", 
-                    return_value=self.vllm_device_manager.tensor_parallel,
+            # cant seem to set the groups properly without this.
+            # - because this is within the same process
+            with world_size_patch, group_patch1, group_patch2:
+            # with world_size_patch, cuda_devices_patch:
+                self.llm = LLM(
+                    model=model.name_or_path,
+                    # device=self.vllm_device_manager.device,
+                    device='cuda',
+                    # device=f'cuda:{self.vllm_device_manager.vllm_device}',
+                    gpu_memory_utilization=self.args.vllm_gpu_memory_utilization,
+                    dtype=self.args.vllm_dtype,
+                    # Automatic Prefix Caching caches the KV cache of existing queries, so that a new query can
+                    # directly reuse the KV cache if it shares the same prefix with one of the existing queries.
+                    # This is particularly useful here because we generate completions from the same prompts.
+                    enable_prefix_caching=True,
+                    max_model_len=self.args.vllm_max_model_len,
+                    hf_overrides = {
+                        'max_position_embeddings': self.max_prompt_length + self.max_completion_length
+                    },
+                    tensor_parallel_size=self.vllm_device_manager.tensor_parallel,
+                    distributed_executor_backend="external_launcher",
+                    enforce_eager=True, # DEBUG
                 )
-                profiling_patch = patch(
-                    "vllm.worker.worker.Worker._assert_memory_footprint_increased_during_profiling", return_value=None
-                )
-                # these are used to pass through the dist groups
-                # - dont really understand how VLLM manages the processs
-                #   groups
-                group_patch1 = patch(
-                    "vllm.distributed.parallel_state.init_world_group",
-                    build_init_world_group([
-                        torch.distributed.get_rank()
-                    ], _init_world_group)
-                )
-                group_patch2 = patch(
-                    "vllm.distributed.parallel_state.init_model_parallel_group",
-                    build_init_world_group([[
-                        torch.distributed.get_rank()
-                    ]], _init_model_parallel_group)
-                )
-                with world_size_patch, group_patch1, group_patch2, profiling_patch:
-                    self.llm = LLM(
-                        model=model.name_or_path,
-                        device=f'cuda:{self.vllm_device_manager.vllm_device}',
-                        gpu_memory_utilization=self.args.vllm_gpu_memory_utilization,
-                        dtype=self.args.vllm_dtype,
-                        # Automatic Prefix Caching caches the KV cache of existing queries, so that a new query can
-                        # directly reuse the KV cache if it shares the same prefix with one of the existing queries.
-                        # This is particularly useful here because we generate completions from the same prompts.
-                        enable_prefix_caching=True,
-                        max_model_len=self.args.vllm_max_model_len,
-                        hf_overrides = {
-                            'max_position_embeddings': self.max_prompt_length + self.max_completion_length
-                        },
-                        # enforce_eager=True, # DEBUG
-                    )
                 self.sampling_params = SamplingParams(
                     temperature=args.temperature,
                     max_tokens=self.max_completion_length,
@@ -783,6 +784,7 @@ class GRPOTrainer(Trainer):
             else:
                 state_dict = unwrapped_model.state_dict()
             if self.vllm_device_manager.is_vllm_process:                                              
+                # Should still work for TP=1
                 llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
                 llm_model.load_weights(state_dict.items())
             # Unmerge the adapter to restore the model to its original state.
@@ -817,27 +819,34 @@ class GRPOTrainer(Trainer):
                 torch.tensor(x, dtype=torch.int32, device=device)
                 for x in self.processing_class(prompts_text)['input_ids']
             ]
+
+            # need to gather the tokens from the TP copies
             all_prompts_ids = self.vllm_device_manager.gather_tensor_list(prompts_tokens)
-            if self.vllm_device_manager.is_vllm_process:                                              
-                outputs = self.llm.generate(
-                    prompt_token_ids=[x.tolist() for x in all_prompts_ids], 
-                    sampling_params=self.sampling_params, 
-                    use_tqdm=False,
-                    # use_tqdm=self.accelerator.is_local_main_process
-                    # use_tqdm=self.accelerator.process_index == 3
-                )
-                completion_ids = [
-                    torch.tensor(out.token_ids, dtype=torch.int32, device=device)
-                    for completions in outputs for out in completions.outputs
-                ]
-            else:
-                completion_ids = None
+            outputs = self.llm.generate(
+                prompt_token_ids=[x.tolist() for x in all_prompts_ids], 
+                sampling_params=self.sampling_params, 
+                # use_tqdm=False,
+                use_tqdm=self.accelerator.is_local_main_process
+                # use_tqdm=self.accelerator.process_index == 3
+            )
+            completion_ids = [
+                torch.tensor(out.token_ids, dtype=torch.int32, device=device)
+                for completions in outputs for out in completions.outputs
+            ]
 
             # Broadcast the completions from the main process to all processes, ensuring each process receives its
             # corresponding slice.
-            completion_ids = self.vllm_device_manager.scatter_tensor_list(
-                tensors=completion_ids, dtype=torch.int32, batch=len(prompts),
-            )
+            # completion_ids = self.vllm_device_manager.scatter_tensor_list(
+            #     tensors=completion_ids, dtype=torch.int32, batch=len(prompts),
+            # )
+            # Slice to keep only the local part of the data
+            if self.vllm_device_manager.tensor_parallel > 1:
+                process_index = self.vllm_device_manager.local_rank_mini_shard
+                tp_slice = slice(
+                    process_index * len(prompts),
+                    (process_index + 1) * len(prompts),
+                )
+                completion_ids = completion_ids[tp_slice]
 
             # Pad the completions, and concatenate them with the prompts
             completion_ids = pad(completion_ids, padding_value=self.processing_class.pad_token_id)
