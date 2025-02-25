@@ -192,11 +192,6 @@ class VLLMDeviceManager:
         return output_tensors.view(-1, *tensor.size()[1:])
 
     @property
-    def is_vllm_process(self):
-        # essentially this is the mini shard leader
-        return self.is_shard_leader
-
-    @property
     def vllm_device(self):
         # NOTE: cannot handle TP for now
         # this indexes into the mini-shard local to the node
@@ -208,10 +203,6 @@ class VLLMDeviceManager:
     def local_rank_mini_shard(self):
         # rank of this process within its mini shard
         return self.process_index % self.tensor_parallel
-
-    @property
-    def is_shard_leader(self):
-        return self.local_rank_mini_shard == 0
 
     @property
     def global_rank_shard_leader(self):
@@ -277,90 +268,6 @@ class VLLMDeviceManager:
             ))
         return outputs
 
-    def scatter_tensor_list(
-        self, 
-        batch: int,
-        dtype,
-        tensors: List[torch.tensor] = None,
-    ):
-
-        # assume all the ranks give the same batch size
-
-        if tensors is not None:
-            assert len(tensors) > 0, "cannot scatter empty tensor list"
-            assert self.is_shard_leader, "only the shard leader can scatte"
-
-            # assume the tensors are 1-D
-            sizes = torch.tensor(
-                [tensors[i].shape[-1] for i in range(len(tensors))],
-                dtype=torch.int32, device=self.device
-            )
-        else:
-
-            # need to broadcast the sizes
-            sizes = torch.empty(
-                batch * self.mini_shard_size, 
-                dtype=torch.int32, device=self.device
-            )
-
-        # get all the sizes
-        self._group_barrier()
-        torch.distributed.broadcast(
-            sizes,
-            group=self._group, 
-            src=self.global_rank_shard_leader,
-        )
-
-        # total number of tokens in one mini shard
-        scattered_sizes_list = sizes.view(-1, batch).sum(axis=-1)
-
-        # largest number of tokens in one rank of the mini shard
-        max_size = scattered_sizes_list.max().item()
-
-        # scatter tensor
-
-        scattered_tensor = torch.empty(
-            # scattered_sizes.sum(),
-            max_size,
-            dtype=dtype, device=self.device
-        )
-
-        # each rank will get a cat of its batch
-        scattered_tensor_list = None
-        if self.is_shard_leader:
-            scattered_tensor_list = []
-            for i in range(self.mini_shard_size):
-
-                # collect all the tokens in the batch
-                # of a rank in the minishard
-                ids = []
-                for j in range(batch):
-                    ids.extend(tensors[i*batch+j])
-
-                # pad it to make all same rank
-                ids.extend([0] * (max_size - len(ids)))
-                scattered_tensor_list.append(
-                    torch.tensor(ids, dtype=dtype, device=self.device)
-                )
-
-        # get max_size tokens of the rank
-        self._group_barrier()
-        torch.distributed.scatter(
-            scattered_tensor, scattered_tensor_list,
-            group=self._group, 
-            src=self.global_rank_shard_leader,
-        )
-
-        # get the number of tokens in this rank
-        r = self.local_rank_mini_shard
-        szs_sum = scattered_sizes_list[r]
-        szs = sizes[r*batch:(r+1)*batch].tolist()
-
-        # drop the padding and split
-        outputs = torch.split(
-            scattered_tensor[:szs_sum], szs
-        )
-        return outputs
 
 class GRPOTrainer(Trainer):
     """
@@ -783,10 +690,11 @@ class GRPOTrainer(Trainer):
                 }
             else:
                 state_dict = unwrapped_model.state_dict()
-            if self.vllm_device_manager.is_vllm_process:                                              
-                # Should still work for TP=1
-                llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
-                llm_model.load_weights(state_dict.items())
+
+            # needs to be done for all ranks now
+            llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
+            llm_model.load_weights(state_dict.items())
+
             # Unmerge the adapter to restore the model to its original state.
             # This must be done after loading weights to ensure they correspond to the merged state.
             if is_peft_model(unwrapped_model):
@@ -825,8 +733,8 @@ class GRPOTrainer(Trainer):
             outputs = self.llm.generate(
                 prompt_token_ids=[x.tolist() for x in all_prompts_ids], 
                 sampling_params=self.sampling_params, 
-                # use_tqdm=False,
-                use_tqdm=self.accelerator.is_local_main_process
+                use_tqdm=False,
+                # use_tqdm=self.accelerator.is_local_main_process
                 # use_tqdm=self.accelerator.process_index == 3
             )
             completion_ids = [
