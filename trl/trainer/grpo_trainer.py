@@ -105,26 +105,6 @@ class RepeatRandomSampler(Sampler):
     def __len__(self):
         return self.num_samples * self.repeat_count
 
-def build_init_world_group(global_ranks, local_rank, f):
-    # hijack
-    # - global_ranks should only contain [[...]]
-    def _wrapper(_, __, *args, **kwargs):
-        nonlocal global_ranks
-        # we dont really support DP and PP
-        grp_name = kwargs.get("group_name")
-        # if grp_name in {'dp', 'pp'}:
-        if grp_name in {'pp'}:
-            global_ranks = [[x] for x in global_ranks[0]]
-        
-        print (local_rank, global_ranks)
-        return f(global_ranks, local_rank, *args, **kwargs)
-    return _wrapper
-
-from vllm.distributed.parallel_state import (
-    init_world_group as _init_world_group,
-    init_model_parallel_group as _init_model_parallel_group
-)
-
 # To be used if VLLM is generating 
 from typing import List
 class VLLMDeviceManager:
@@ -206,7 +186,7 @@ class VLLMDeviceManager:
         return self.process_index % self.tensor_parallel
 
     def group_devices(self):
-        i = self.local_process_index  //  self.tensor_parallel
+        i = self.process_index  //  self.tensor_parallel
         return list(range(i*self.tensor_parallel, (i+1)*self.tensor_parallel))
 
     def _group_barrier(self):
@@ -541,58 +521,37 @@ class GRPOTrainer(Trainer):
                 vllm_device=self.args.vllm_device
             )
 
-            world_size_patch = patch(
-                "torch.distributed.get_world_size", 
-                return_value=self.vllm_device_manager.tensor_parallel,
-            )
-            group_patch1 = patch(
-                "vllm.distributed.parallel_state.init_world_group",
-                build_init_world_group(
-                    self.vllm_device_manager.group_devices(),
-                    self.vllm_device_manager.local_process_index,
-                    _init_world_group
-                )
-            )
-            group_patch2 = patch(
-                "vllm.distributed.parallel_state.init_model_parallel_group",
-                build_init_world_group(
-                    [self.vllm_device_manager.group_devices()],
-                    self.vllm_device_manager.local_process_index,
-                    _init_model_parallel_group
-                )
-            )
-
             # cant seem to set the groups properly without this.
             # - because this is within the same process
-            with world_size_patch, group_patch1, group_patch2:
+            # with world_size_patch, group_patch1, group_patch2:
             # with world_size_patch, cuda_devices_patch:
-                self.llm = LLM(
-                    model=model.name_or_path,
-                    # device=self.vllm_device_manager.device,
-                    device='cuda',
-                    # device=f'cuda:{self.vllm_device_manager.vllm_device}',
-                    gpu_memory_utilization=self.args.vllm_gpu_memory_utilization,
-                    dtype=self.args.vllm_dtype,
-                    # Automatic Prefix Caching caches the KV cache of existing queries, so that a new query can
-                    # directly reuse the KV cache if it shares the same prefix with one of the existing queries.
-                    # This is particularly useful here because we generate completions from the same prompts.
-                    enable_prefix_caching=True,
-                    max_model_len=self.args.vllm_max_model_len,
-                    hf_overrides = {
-                        'max_position_embeddings': self.max_prompt_length + self.max_completion_length
-                    },
-                    max_num_seqs=(
-                        self.args.per_device_train_batch_size *
-                        self.vllm_device_manager.tensor_parallel, # because of the gather
-                    ),
-                    tensor_parallel_size=self.vllm_device_manager.tensor_parallel,
-                    distributed_executor_backend="external_launcher",
-                    enforce_eager=True, # DEBUG
-                )
-                self.sampling_params = SamplingParams(
-                    temperature=args.temperature,
-                    max_tokens=self.max_completion_length,
-                )
+            self.llm = LLM(
+                model=model.name_or_path,
+                # device=self.vllm_device_manager.device,
+                device='cuda',
+                # device=f'cuda:{self.vllm_device_manager.vllm_device}',
+                gpu_memory_utilization=self.args.vllm_gpu_memory_utilization,
+                dtype=self.args.vllm_dtype,
+                # Automatic Prefix Caching caches the KV cache of existing queries, so that a new query can
+                # directly reuse the KV cache if it shares the same prefix with one of the existing queries.
+                # This is particularly useful here because we generate completions from the same prompts.
+                enable_prefix_caching=True,
+                max_model_len=self.args.vllm_max_model_len,
+                hf_overrides = {
+                    'max_position_embeddings': self.max_prompt_length + self.max_completion_length
+                },
+                max_num_seqs=(
+                    self.args.per_device_train_batch_size *
+                    self.vllm_device_manager.tensor_parallel # because of the gather
+                ),
+                tensor_parallel_size=self.vllm_device_manager.tensor_parallel,
+                distributed_executor_backend="external_launcher",
+                enforce_eager=True, # DEBUG
+            )
+            self.sampling_params = SamplingParams(
+                temperature=args.temperature,
+                max_tokens=self.max_completion_length,
+            )
 
             self._last_loaded_step = 0  # tag to avoid useless loading during grad accumulation
 
