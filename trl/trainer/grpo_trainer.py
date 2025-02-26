@@ -586,6 +586,7 @@ class GRPOTrainer(Trainer):
                     hf_overrides = {
                         'max_position_embeddings': self.max_prompt_length + self.max_completion_length
                     },
+                    max_num_seqs=self.args.per_device_train_batch_size,
                     tensor_parallel_size=self.vllm_device_manager.tensor_parallel,
                     distributed_executor_backend="external_launcher",
                     enforce_eager=True, # DEBUG
@@ -665,10 +666,55 @@ class GRPOTrainer(Trainer):
         return selective_log_softmax(logits, input_ids)  #  compute logprobs for the input tokens
 
     def _move_model_to_vllm(self):
-        # this patch is for accelerate.utils.other.extract_model_from_parallel
-        # because otherwise it will mess with the top-level FSDP wrapper
+
+        # FSPD with model sharding
+        # - we move wrapped module at a time
+        if (
+            self.accelerator.state.fsdp_plugin is not None and
+            self.use_vllm
+        ):
+            from torch.distributed.fsdp.fully_sharded_data_parallel import FullyShardedDataParallel as FSDP, FSDP_WRAPPED_MODULE
+            from torch.distributed.fsdp._common_utils import _get_handle_fqns_from_root
+
+            # pointed to the llm model
+            llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
+
+            # FSDP does not have a nice function to unshard module by module
+            # - so we need to use a lot of internals
+            # - maybe cleaner way is to install a forward hook and do one dummy 
+            #   forward
+            from torch.distributed.fsdp._unshard_param_utils import _unshard_params_for_summon
+            if not hasattr(self, '_fsdp_modules'):
+
+                # memorize the traversal because it will be very slow
+                import torch.distributed.fsdp._traversal_utils as traversal_utils
+                self._fsdp_modules = traversal_utils._get_fsdp_states_with_modules(self.model)
+
+            # needs to be done for all ranks now
+            for state, module in zip(*self._fsdp_modules):
+                with _unshard_params_for_summon(
+                    module=module,
+                    state=state,
+                    writeback=False,
+                    rank0_only=False,
+                    offload_to_cpu=False,
+                    with_grads=False,
+                ):
+
+                    state_dict = {} # for this FSDP module only
+                    for key, param_info in zip(
+                        _get_handle_fqns_from_root(state, state._handle), 
+                        state._flat_param._param_infos
+                    ):
+                        state_dict[key] = getattr(param_info.module, param_info.param_name)
+
+                    # load the partial state dict
+                    llm_model.load_weights(state_dict.items())
+                    del state_dict
+
+            return 
+
         with (
-            patch("accelerate.utils.other.is_torch_distributed_available", return_value=False),
             unwrap_model_for_generation(self.model, self.accelerator) as unwrapped_model
         ):
             if is_compiled_module(unwrapped_model):
@@ -718,7 +764,6 @@ class GRPOTrainer(Trainer):
         if self.args.use_vllm:
             # First, have main process load weights if needed
             if self.state.global_step != self._last_loaded_step:
-                self._move_model_to_vllm()
                 self._last_loaded_step = self.state.global_step
 
             # Generate completions using vLLM: gather all prompts and use them in a single call in the main process
