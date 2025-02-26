@@ -546,7 +546,7 @@ class GRPOTrainer(Trainer):
                 ),
                 tensor_parallel_size=self.vllm_device_manager.tensor_parallel,
                 distributed_executor_backend="external_launcher",
-                enforce_eager=True, # DEBUG
+                # enforce_eager=True, # DEBUG
             )
             self.sampling_params = SamplingParams(
                 temperature=args.temperature,
