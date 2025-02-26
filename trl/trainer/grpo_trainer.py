@@ -107,7 +107,12 @@ class RepeatRandomSampler(Sampler):
 
 def build_init_world_group(global_ranks, local_rank, f):
     # hijack
+    # - global_ranks should only contain [[...]]
     def _wrapper(_, __, *args, **kwargs):
+        # we dont really support DP and PP
+        grp_name = kwargs.get("group_name")
+        if grp_name in {'dp', 'pp'}:
+            return f([[x] for x in global_ranks[0]], local_rank, *args, **kwargs)
         return f(global_ranks, local_rank, *args, **kwargs)
     return _wrapper
 
@@ -136,7 +141,7 @@ class VLLMDeviceManager:
         self.device = f'cuda:{local_process_index}'
 
         if vllm_device.startswith("tp:"):
-            self.tensor_parallel = vllm_device.split(":")
+            self.tensor_parallel = vllm_device.split(":")[-1]
             self.tensor_parallel = int(self.tensor_parallel)
 
         # get the local world size
@@ -183,7 +188,7 @@ class VLLMDeviceManager:
         # this follows accelerate.utils.operations.gather, which is an all 
         # gather operation, used to implement the gather op here.
         output_tensors = torch.empty(
-            self.mini_shard_size * tensor.numel(),
+            self.tensor_parallel * tensor.numel(),
             dtype=tensor.dtype,
             device=tensor.device,
         )
@@ -191,24 +196,24 @@ class VLLMDeviceManager:
         torch.distributed.all_gather_into_tensor(output_tensors, tensor, group=self._group)
         return output_tensors.view(-1, *tensor.size()[1:])
 
-    @property
-    def vllm_device(self):
-        # NOTE: cannot handle TP for now
-        # this indexes into the mini-shard local to the node
-        local_mini_shard_index = self.local_process_index // self.mini_shard_size
-        # FIXME: this one is to be changed when we consider TP and local shards
-        return self.local_world_size + local_mini_shard_index
+    # @property
+    # def vllm_device(self):
+    #     # NOTE: cannot handle TP for now
+    #     # this indexes into the mini-shard local to the node
+    #     local_mini_shard_index = self.local_process_index // self.mini_shard_size
+    #     # FIXME: this one is to be changed when we consider TP and local shards
+    #     return self.local_world_size + local_mini_shard_index
 
     @property
     def local_rank_mini_shard(self):
         # rank of this process within its mini shard
         return self.process_index % self.tensor_parallel
 
-    @property
-    def global_rank_shard_leader(self):
-        # the global rank of the shard leader
-        mini_shard_idx = self.process_index // self.mini_shard_size
-        return mini_shard_idx * self.mini_shard_size
+    # @property
+    # def global_rank_shard_leader(self):
+    #     # the global rank of the shard leader
+    #     mini_shard_idx = self.process_index // self.mini_shard_size
+    #     return mini_shard_idx * self.mini_shard_size
 
     def group_devices(self):
         i = self.local_process_index  //  self.tensor_parallel
