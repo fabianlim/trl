@@ -109,10 +109,14 @@ def build_init_world_group(global_ranks, local_rank, f):
     # hijack
     # - global_ranks should only contain [[...]]
     def _wrapper(_, __, *args, **kwargs):
+        nonlocal global_ranks
         # we dont really support DP and PP
         grp_name = kwargs.get("group_name")
-        if grp_name in {'dp', 'pp'}:
-            return f([[x] for x in global_ranks[0]], local_rank, *args, **kwargs)
+        # if grp_name in {'dp', 'pp'}:
+        if grp_name in {'pp'}:
+            global_ranks = [[x] for x in global_ranks[0]]
+        
+        print (local_rank, global_ranks)
         return f(global_ranks, local_rank, *args, **kwargs)
     return _wrapper
 
@@ -196,24 +200,10 @@ class VLLMDeviceManager:
         torch.distributed.all_gather_into_tensor(output_tensors, tensor, group=self._group)
         return output_tensors.view(-1, *tensor.size()[1:])
 
-    # @property
-    # def vllm_device(self):
-    #     # NOTE: cannot handle TP for now
-    #     # this indexes into the mini-shard local to the node
-    #     local_mini_shard_index = self.local_process_index // self.mini_shard_size
-    #     # FIXME: this one is to be changed when we consider TP and local shards
-    #     return self.local_world_size + local_mini_shard_index
-
     @property
     def local_rank_mini_shard(self):
         # rank of this process within its mini shard
         return self.process_index % self.tensor_parallel
-
-    # @property
-    # def global_rank_shard_leader(self):
-    #     # the global rank of the shard leader
-    #     mini_shard_idx = self.process_index // self.mini_shard_size
-    #     return mini_shard_idx * self.mini_shard_size
 
     def group_devices(self):
         i = self.local_process_index  //  self.tensor_parallel
@@ -591,7 +581,10 @@ class GRPOTrainer(Trainer):
                     hf_overrides = {
                         'max_position_embeddings': self.max_prompt_length + self.max_completion_length
                     },
-                    max_num_seqs=self.args.per_device_train_batch_size,
+                    max_num_seqs=(
+                        self.args.per_device_train_batch_size *
+                        self.vllm_device_manager.tensor_parallel, # because of the gather
+                    ),
                     tensor_parallel_size=self.vllm_device_manager.tensor_parallel,
                     distributed_executor_backend="external_launcher",
                     enforce_eager=True, # DEBUG
