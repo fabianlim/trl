@@ -477,6 +477,36 @@ class GRPOTrainer(Trainer):
             optimizers=optimizers,
         )
 
+        if not is_deepspeed_zero3_enabled():
+
+            # for big models wrap it
+            def is_embedding_policy(
+                module: torch.nn.Module,
+                recurse: bool,
+                nonwrapped_numel: int,
+            ):
+                if recurse:
+                    # always recurse
+                    return True
+
+                C = module.__class__.__name__
+                return (
+                    C == 'Embedding' or (
+                        C == 'Linear' and 
+                        max(*module.weight.shape) > 100000
+                    )
+                )
+
+            self.accelerator.state.fsdp_plugin.set_auto_wrap_policy(self.model)
+            from torch.distributed.fsdp.wrap import _or_policy
+            from functools import partial
+            self.accelerator.state.fsdp_plugin.auto_wrap_policy = partial(
+                _or_policy, policies = [
+                    self.accelerator.state.fsdp_plugin.auto_wrap_policy, 
+                    is_embedding_policy
+                ]
+            )
+
         if self.ref_model is not None and not is_deepspeed_zero3_enabled():
             # NOTE: we still should FSDP the model
             self.ref_model = self.accelerator.prepare(self.ref_model)
@@ -721,7 +751,7 @@ class GRPOTrainer(Trainer):
         if self.args.use_vllm:
             # First, have main process load weights if needed
             if self.state.global_step != self._last_loaded_step:
-                self._move_model_to_vllm()
+                # self._move_model_to_vllm()
                 self._last_loaded_step = self.state.global_step
 
             # Generate completions using vLLM: gather all prompts and use them in a single call in the main process
