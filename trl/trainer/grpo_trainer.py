@@ -701,6 +701,9 @@ class GRPOTrainer(Trainer):
 
             return 
 
+        # Temporary disable other paths
+        return
+
         with (
             unwrap_model_for_generation(self.model, self.accelerator) as unwrapped_model
         ):
@@ -751,7 +754,7 @@ class GRPOTrainer(Trainer):
         if self.args.use_vllm:
             # First, have main process load weights if needed
             if self.state.global_step != self._last_loaded_step:
-                # self._move_model_to_vllm()
+                self._move_model_to_vllm()
                 self._last_loaded_step = self.state.global_step
 
             # Generate completions using vLLM: gather all prompts and use them in a single call in the main process
