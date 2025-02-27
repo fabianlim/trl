@@ -653,11 +653,14 @@ class GRPOTrainer(Trainer):
         return selective_log_softmax(logits, input_ids)  #  compute logprobs for the input tokens
 
     def _move_model_to_vllm(self):
+        return # disable for awhile
 
         # FSPD with model sharding
         # - we move wrapped module at a time
+        # NOTE: fsdp_plugin is not gauranteed to be active, so 
+        # need to check for that
         if (
-            self.accelerator.state.fsdp_plugin is not None and
+            self.accelerator.is_fsdp_enabled and
             self.use_vllm
         ):
             from torch.distributed.fsdp.fully_sharded_data_parallel import FullyShardedDataParallel as FSDP, FSDP_WRAPPED_MODULE
@@ -688,10 +691,15 @@ class GRPOTrainer(Trainer):
                     with_grads=False,
                 ):
 
+                    fqns_info = []
+                    try:
+                        fqns_info = _get_handle_fqns_from_root(state, state._handle)
+                    except IndexError:
+                        pass # could be empty if wrapper has no managed aprams
+
                     state_dict = {} # for this FSDP module only
                     for key, param_info in zip(
-                        _get_handle_fqns_from_root(state, state._handle), 
-                        state._flat_param._param_infos
+                        fqns_info, state._flat_param._param_infos
                     ):
                         state_dict[key] = getattr(param_info.module, param_info.param_name)
 
