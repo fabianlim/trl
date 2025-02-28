@@ -685,6 +685,7 @@ class GRPOTrainer(Trainer):
 
             # need to gather the tokens from the TP copies
             all_prompts_ids = self.vllm_device_manager.gather_tensor_list(prompts_tokens)
+            all_prompts_ids = all_prompts_ids[:1]
             outputs = self.llm.generate(
                 prompt_token_ids=[x.tolist() for x in all_prompts_ids], 
                 sampling_params=self.sampling_params, 
@@ -703,13 +704,13 @@ class GRPOTrainer(Trainer):
             #     tensors=completion_ids, dtype=torch.int32, batch=len(prompts),
             # )
             # Slice to keep only the local part of the data
-            if self.vllm_device_manager.tensor_parallel > 1:
-                process_index = self.vllm_device_manager.local_rank_mini_shard
-                tp_slice = slice(
-                    process_index * len(prompts),
-                    (process_index + 1) * len(prompts),
-                )
-                completion_ids = completion_ids[tp_slice]
+            # if self.vllm_device_manager.tensor_parallel > 1:
+            #     process_index = self.vllm_device_manager.local_rank_mini_shard
+            #     tp_slice = slice(
+            #         process_index * len(prompts),
+            #         (process_index + 1) * len(prompts),
+            #     )
+            #     completion_ids = completion_ids[tp_slice]
 
             # Pad the completions, and concatenate them with the prompts
             completion_ids = pad(completion_ids, padding_value=self.processing_class.pad_token_id)
@@ -838,7 +839,7 @@ class GRPOTrainer(Trainer):
             if wandb.run is not None and self.accelerator.is_main_process:
                 wandb.log({"completions": wandb.Table(dataframe=df)})
 
-        torch.distributed.breakpoint()
+        # torch.distributed.breakpoint()
         if self.accelerator.is_local_main_process:
             print ("text", outputs[0].outputs[0].text)
 
