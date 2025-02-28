@@ -671,16 +671,12 @@ class GRPOTrainer(Trainer):
         return selective_log_softmax(logits, input_ids)  #  compute logprobs for the input tokens
 
     def _move_model_to_vllm(self):
-        return # disable for awhile
 
         # FSPD with model sharding
         # - we move wrapped module at a time
         # NOTE: fsdp_plugin is not gauranteed to be active, so 
         # need to check for that
-        if (
-            self.accelerator.is_fsdp_enabled and
-            self.use_vllm
-        ):
+        if self.is_fsdp_enabled and self.use_vllm:
             from torch.distributed.fsdp.fully_sharded_data_parallel import FullyShardedDataParallel as FSDP, FSDP_WRAPPED_MODULE
             from torch.distributed.fsdp._common_utils import _get_handle_fqns_from_root
 
@@ -709,16 +705,15 @@ class GRPOTrainer(Trainer):
                     with_grads=False,
                 ):
 
-                    fqns_info = []
-                    try:
-                        fqns_info = _get_handle_fqns_from_root(state, state._handle)
-                    except IndexError:
-                        pass # could be empty if wrapper has no managed aprams
+                    flat_param = state._flat_param
 
                     state_dict = {} # for this FSDP module only
                     for key, param_info in zip(
-                        fqns_info, state._flat_param._param_infos
+                        state._exec_order_data.param_to_fqn[flat_param],
+                        flat_param._param_infos
                     ):
+                        # if self.accelerator.is_main_process:
+                        #     print ('loaded', key)
                         state_dict[key] = getattr(param_info.module, param_info.param_name)
 
                     # load the partial state dict
@@ -726,9 +721,6 @@ class GRPOTrainer(Trainer):
                     del state_dict
 
             return 
-
-        # Temporary disable other paths
-        return
 
         with (
             unwrap_model_for_generation(self.model, self.accelerator) as unwrapped_model
