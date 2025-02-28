@@ -567,12 +567,14 @@ class GRPOTrainer(Trainer):
                 hf_overrides = {
                     'max_position_embeddings': self.max_prompt_length + self.max_completion_length
                 },
-                max_num_seqs=(
-                    self.args.per_device_train_batch_size *
-                    self.vllm_device_manager.tensor_parallel # because of the gather
-                ),
+                # max_num_seqs=(
+                #     self.args.per_device_train_batch_size *
+                #     self.vllm_device_manager.tensor_parallel # because of the gather
+                # ),
+                max_num_seqs=1,
                 tensor_parallel_size=self.vllm_device_manager.tensor_parallel,
                 distributed_executor_backend="external_launcher",
+                enable_chunked_prefill=False,
                 # enforce_eager=True, # DEBUG
             )
             self.sampling_params = SamplingParams(
@@ -685,7 +687,6 @@ class GRPOTrainer(Trainer):
 
             # need to gather the tokens from the TP copies
             all_prompts_ids = self.vllm_device_manager.gather_tensor_list(prompts_tokens)
-            all_prompts_ids = all_prompts_ids[:1]
             outputs = self.llm.generate(
                 prompt_token_ids=[x.tolist() for x in all_prompts_ids], 
                 sampling_params=self.sampling_params, 
@@ -704,13 +705,13 @@ class GRPOTrainer(Trainer):
             #     tensors=completion_ids, dtype=torch.int32, batch=len(prompts),
             # )
             # Slice to keep only the local part of the data
-            # if self.vllm_device_manager.tensor_parallel > 1:
-            #     process_index = self.vllm_device_manager.local_rank_mini_shard
-            #     tp_slice = slice(
-            #         process_index * len(prompts),
-            #         (process_index + 1) * len(prompts),
-            #     )
-            #     completion_ids = completion_ids[tp_slice]
+            if self.vllm_device_manager.tensor_parallel > 1:
+                process_index = self.vllm_device_manager.local_rank_mini_shard
+                tp_slice = slice(
+                    process_index * len(prompts),
+                    (process_index + 1) * len(prompts),
+                )
+                completion_ids = completion_ids[tp_slice]
 
             # Pad the completions, and concatenate them with the prompts
             completion_ids = pad(completion_ids, padding_value=self.processing_class.pad_token_id)
