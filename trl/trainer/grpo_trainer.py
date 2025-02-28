@@ -653,88 +653,7 @@ class GRPOTrainer(Trainer):
         return selective_log_softmax(logits, input_ids)  #  compute logprobs for the input tokens
 
     def _move_model_to_vllm(self):
-
-        # FSPD with model sharding
-        # - we move wrapped module at a time
-        if (
-            self.accelerator.state.fsdp_plugin is not None and
-            self.use_vllm
-        ):
-            from torch.distributed.fsdp.fully_sharded_data_parallel import FullyShardedDataParallel as FSDP, FSDP_WRAPPED_MODULE
-            from torch.distributed.fsdp._common_utils import _get_handle_fqns_from_root
-
-            # pointed to the llm model
-            llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
-
-            # FSDP does not have a nice function to unshard module by module
-            # - so we need to use a lot of internals
-            # - maybe cleaner way is to install a forward hook and do one dummy 
-            #   forward
-            from torch.distributed.fsdp._unshard_param_utils import _unshard_params_for_summon
-            if not hasattr(self, '_fsdp_modules'):
-
-                # memorize the traversal because it will be very slow
-                import torch.distributed.fsdp._traversal_utils as traversal_utils
-                self._fsdp_modules = traversal_utils._get_fsdp_states_with_modules(self.model)
-
-            # needs to be done for all ranks now
-            for state, module in zip(*self._fsdp_modules):
-                with _unshard_params_for_summon(
-                    module=module,
-                    state=state,
-                    writeback=False,
-                    rank0_only=False,
-                    offload_to_cpu=False,
-                    with_grads=False,
-                ):
-
-                    state_dict = {} # for this FSDP module only
-                    for key, param_info in zip(
-                        _get_handle_fqns_from_root(state, state._handle), 
-                        state._flat_param._param_infos
-                    ):
-                        state_dict[key] = getattr(param_info.module, param_info.param_name)
-
-                    # load the partial state dict
-                    llm_model.load_weights(state_dict.items())
-                    del state_dict
-
-            return 
-
-        # Temporary disable other paths
         return
-
-        with (
-            unwrap_model_for_generation(self.model, self.accelerator) as unwrapped_model
-        ):
-            if is_compiled_module(unwrapped_model):
-                unwrapped_model = unwrapped_model._orig_mod
-            if is_peft_model(unwrapped_model):
-                unwrapped_model.merge_adapter()
-                state_dict = unwrapped_model.state_dict()
-                # Remove base_model and base_layer prefixes
-                state_dict = {
-                    k.removeprefix("base_model.model.").replace(".base_layer", ""): v for k, v in state_dict.items()
-                }
-                # Remove values with adapter prefix (example: "_lora")
-                state_dict = {k: v for k, v in state_dict.items() if unwrapped_model.prefix not in k}
-                # When module to save, remove its prefix and discard the original module
-                state_dict = {
-                    k.replace("modules_to_save.default.", ""): v
-                    for k, v in state_dict.items()
-                    if "original_module" not in k
-                }
-            else:
-                state_dict = unwrapped_model.state_dict()
-
-            # needs to be done for all ranks now
-            llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
-            llm_model.load_weights(state_dict.items())
-
-            # Unmerge the adapter to restore the model to its original state.
-            # This must be done after loading weights to ensure they correspond to the merged state.
-            if is_peft_model(unwrapped_model):
-                unwrapped_model.unmerge_adapter()
 
     def _prepare_inputs(self, inputs: dict[str, Union[torch.Tensor, Any]]) -> dict[str, Union[torch.Tensor, Any]]:
         device = self.accelerator.device
@@ -918,6 +837,10 @@ class GRPOTrainer(Trainer):
 
             if wandb.run is not None and self.accelerator.is_main_process:
                 wandb.log({"completions": wandb.Table(dataframe=df)})
+
+        torch.distributed.breakpoint()
+        if self.accelerator.is_local_main_process:
+            print ("text", outputs[0].outputs[0].text)
 
         return {
             "prompt_ids": prompt_ids,
