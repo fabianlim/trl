@@ -243,6 +243,46 @@ class VLLMDeviceManager:
             ))
         return outputs
 
+def is_fsdp_sharding_enabled():
+
+    # use the plugin to help us parse the mode
+    from accelerate import FullyShardedDataParallelPlugin
+    from torch.distributed.fsdp import ShardingStrategy
+    plugin = FullyShardedDataParallelPlugin()
+    return plugin.sharding_strategy in {
+        ShardingStrategy.FULL_SHARD, 
+        ShardingStrategy.HYBRID_SHARD
+    }
+
+def fsdp_sharding_policy(auto_wrap_policy, embedding_vocab_size: int = 100000):
+
+    # for big models wrap it
+    def is_module_embedding(
+        module: torch.nn.Module,
+        recurse: bool,
+        nonwrapped_numel: int,
+    ):
+        if recurse:
+            # always recurse
+            return True
+
+        return (
+            isinstance(module, torch.nn.Embedding) or
+            (
+                isinstance(module, torch.nn.Linear) and
+                max(*module.weight.shape) > embedding_vocab_size
+            )
+        )
+
+    # a slighly improved one over the transformers wrapping policy
+    # that also wraps the embedding and head
+    from torch.distributed.fsdp.wrap import _or_policy
+    from functools import partial
+    return partial(
+        _or_policy, policies = [
+            auto_wrap_policy, is_module_embedding
+        ]
+    )
 
 class GRPOTrainer(Trainer):
     """
@@ -386,16 +426,16 @@ class GRPOTrainer(Trainer):
             model = get_peft_model(model, peft_config)
 
         # Reference model
-        # if is_deepspeed_zero3_enabled():
-        #     self.ref_model = AutoModelForCausalLM.from_pretrained(model_id, **model_init_kwargs)
-        # elif not is_peft_model(model):
-        #     # If PEFT configuration is not provided, create a reference model based on the initial model.
-        #     self.ref_model = create_reference_model(model)
-        # else:
-        #     # If PEFT is used, the reference model is not needed since the adapter can be disabled
-        #     # to revert to the initial model.
-        #     self.ref_model = None
-        self.ref_model = None
+        if is_deepspeed_zero3_enabled() or is_fsdp_sharding_enabled():
+            self.ref_model = AutoModelForCausalLM.from_pretrained(model_id, **model_init_kwargs)
+            print ('No CLONING of Ref MODEL!')
+        elif not is_peft_model(model):
+            # If PEFT configuration is not provided, create a reference model based on the initial model.
+            self.ref_model = create_reference_model(model)
+        else:
+            # If PEFT is used, the reference model is not needed since the adapter can be disabled
+            # to revert to the initial model.
+            self.ref_model = None
 
         # Processing class
         if processing_class is None:
@@ -478,34 +518,12 @@ class GRPOTrainer(Trainer):
             optimizers=optimizers,
         )
 
-        if not is_deepspeed_zero3_enabled():
+        if is_fsdp_sharding_enabled():
 
-            # for big models wrap it
-            def is_embedding_policy(
-                module: torch.nn.Module,
-                recurse: bool,
-                nonwrapped_numel: int,
-            ):
-                if recurse:
-                    # always recurse
-                    return True
-
-                C = module.__class__.__name__
-                return (
-                    C == 'Embedding' or (
-                        C == 'Linear' and 
-                        max(*module.weight.shape) > 100000
-                    )
-                )
-
+            # do this to initialze the transformers policy
             self.accelerator.state.fsdp_plugin.set_auto_wrap_policy(self.model)
-            from torch.distributed.fsdp.wrap import _or_policy
-            from functools import partial
-            self.accelerator.state.fsdp_plugin.auto_wrap_policy = partial(
-                _or_policy, policies = [
-                    self.accelerator.state.fsdp_plugin.auto_wrap_policy, 
-                    is_embedding_policy
-                ]
+            self.accelerator.state.fsdp_plugin.auto_wrap_policy = (
+                fsdp_sharding_policy(self.accelerator.state.fsdp_plugin.auto_wrap_policy)
             )
 
         # Check if the per_device_train/eval_batch_size * num processes can be divided by the number of generations
@@ -605,11 +623,11 @@ class GRPOTrainer(Trainer):
         if self.ref_model is not None:
             if self.is_deepspeed_enabled:
                 self.ref_model = prepare_deepspeed(self.ref_model, self.accelerator)
+            elif self.is_fsdp_enabled:
+                self.ref_model = self.accelerator.prepare(self.ref_model)
             else:
                 # this one has no sharding
                 self.ref_model = self.accelerator.prepare_model(self.ref_model, evaluation_mode=True)
-                # self.ref_model = self.accelerator.prepare(self.ref_model)
-
 
         if args.sync_ref_model:
             self.add_callback(SyncRefModelCallback(ref_model=self.ref_model, accelerator=self.accelerator))
@@ -827,16 +845,16 @@ class GRPOTrainer(Trainer):
 
         logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
 
-        # with torch.inference_mode():
-        #     if self.ref_model is not None:
-        #         ref_per_token_logps = self._get_per_token_logps(
-        #             self.ref_model, prompt_completion_ids, attention_mask, logits_to_keep
-        #         )
-        #     else:
-        #         with self.accelerator.unwrap_model(self.model).disable_adapter():
-        #             ref_per_token_logps = self._get_per_token_logps(
-        #                 self.model, prompt_completion_ids, attention_mask, logits_to_keep
-        #             )
+        with torch.inference_mode():
+            if self.ref_model is not None:
+                ref_per_token_logps = self._get_per_token_logps(
+                    self.ref_model, prompt_completion_ids, attention_mask, logits_to_keep
+                )
+            else:
+                with self.accelerator.unwrap_model(self.model).disable_adapter():
+                    ref_per_token_logps = self._get_per_token_logps(
+                        self.model, prompt_completion_ids, attention_mask, logits_to_keep
+                    )
 
         # Decode the generated completions
         completions_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
@@ -932,7 +950,7 @@ class GRPOTrainer(Trainer):
             "prompt_mask": prompt_mask,
             "completion_ids": completion_ids,
             "completion_mask": completion_mask,
-            # "ref_per_token_logps": ref_per_token_logps,
+            "ref_per_token_logps": ref_per_token_logps,
             "advantages": advantages,
         }
 
@@ -950,9 +968,8 @@ class GRPOTrainer(Trainer):
         per_token_logps = self._get_per_token_logps(model, input_ids, attention_mask, logits_to_keep)
 
         # Compute the KL divergence between the model and the reference model
-        # ref_per_token_logps = inputs["ref_per_token_logps"]
-        # per_token_kl = torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
-        per_token_kl = 0
+        ref_per_token_logps = inputs["ref_per_token_logps"]
+        per_token_kl = torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
 
         # x - x.detach() allows for preserving gradients from x
         advantages = inputs["advantages"]
@@ -971,8 +988,8 @@ class GRPOTrainer(Trainer):
         completion_length = self.accelerator.gather_for_metrics(completion_mask.sum(1)).float().mean().item()
         self._metrics["completion_length"].append(completion_length)
 
-        # mean_kl = (per_token_kl * completion_mask).sum() / completion_mask.sum()
-        # self._metrics["kl"].append(self.accelerator.gather_for_metrics(mean_kl).mean().item())
+        mean_kl = (per_token_kl * completion_mask).sum() / completion_mask.sum()
+        self._metrics["kl"].append(self.accelerator.gather_for_metrics(mean_kl).mean().item())
 
         return loss
 
