@@ -478,35 +478,35 @@ class GRPOTrainer(Trainer):
             optimizers=optimizers,
         )
 
-        if not is_deepspeed_zero3_enabled():
+        # if not is_deepspeed_zero3_enabled():
 
-            # for big models wrap it
-            def is_embedding_policy(
-                module: torch.nn.Module,
-                recurse: bool,
-                nonwrapped_numel: int,
-            ):
-                if recurse:
-                    # always recurse
-                    return True
+        #     # for big models wrap it
+        #     def is_embedding_policy(
+        #         module: torch.nn.Module,
+        #         recurse: bool,
+        #         nonwrapped_numel: int,
+        #     ):
+        #         if recurse:
+        #             # always recurse
+        #             return True
 
-                C = module.__class__.__name__
-                return (
-                    C == 'Embedding' or (
-                        C == 'Linear' and 
-                        max(*module.weight.shape) > 100000
-                    )
-                )
+        #         C = module.__class__.__name__
+        #         return (
+        #             C == 'Embedding' or (
+        #                 C == 'Linear' and 
+        #                 max(*module.weight.shape) > 100000
+        #             )
+        #         )
 
-            self.accelerator.state.fsdp_plugin.set_auto_wrap_policy(self.model)
-            from torch.distributed.fsdp.wrap import _or_policy
-            from functools import partial
-            self.accelerator.state.fsdp_plugin.auto_wrap_policy = partial(
-                _or_policy, policies = [
-                    self.accelerator.state.fsdp_plugin.auto_wrap_policy, 
-                    is_embedding_policy
-                ]
-            )
+        #     self.accelerator.state.fsdp_plugin.set_auto_wrap_policy(self.model)
+        #     from torch.distributed.fsdp.wrap import _or_policy
+        #     from functools import partial
+        #     self.accelerator.state.fsdp_plugin.auto_wrap_policy = partial(
+        #         _or_policy, policies = [
+        #             self.accelerator.state.fsdp_plugin.auto_wrap_policy, 
+        #             is_embedding_policy
+        #         ]
+        #     )
 
         # Check if the per_device_train/eval_batch_size * num processes can be divided by the number of generations
         num_processes = self.accelerator.num_processes
@@ -562,7 +562,7 @@ class GRPOTrainer(Trainer):
                 # Automatic Prefix Caching caches the KV cache of existing queries, so that a new query can
                 # directly reuse the KV cache if it shares the same prefix with one of the existing queries.
                 # This is particularly useful here because we generate completions from the same prompts.
-                enable_prefix_caching=True,
+                # enable_prefix_caching=True,
                 max_model_len=self.args.vllm_max_model_len,
                 hf_overrides = {
                     'max_position_embeddings': self.max_prompt_length + self.max_completion_length
@@ -573,11 +573,13 @@ class GRPOTrainer(Trainer):
                 ),
                 tensor_parallel_size=self.vllm_device_manager.tensor_parallel,
                 distributed_executor_backend="external_launcher",
-                # enforce_eager=True, # DEBUG
+                enforce_eager=True, # DEBUG
             )
             self.sampling_params = SamplingParams(
                 temperature=args.temperature,
                 max_tokens=self.max_completion_length,
+                logprobs=1,
+                prompt_logprobs=1,
             )
 
             self._last_loaded_step = 0  # tag to avoid useless loading during grad accumulation
@@ -640,292 +642,57 @@ class GRPOTrainer(Trainer):
         # preventing discrepancies in group formation.
         return RepeatRandomSampler(eval_dataset, self.num_generations, seed=self.args.seed)
 
-    # Get the per-token log probabilities for the completions for the model and the reference model
-    def _get_per_token_logps(self, model, input_ids, attention_mask, logits_to_keep):
-        # We add 1 to `logits_to_keep` because the last logits of the sequence is later excluded
-        logits = model(input_ids=input_ids, attention_mask=attention_mask, logits_to_keep=logits_to_keep + 1).logits
-        logits = logits[:, :-1, :]  # (B, L-1, V), exclude the last logit: it corresponds to the next token pred
-
-        input_ids = input_ids[:, -logits_to_keep:]
-        # For transformers<=4.48, logits_to_keep argument isn't supported, so here we drop logits ourselves.
-        # See https://github.com/huggingface/trl/issues/2770
-        logits = logits[:, -logits_to_keep:]
-        return selective_log_softmax(logits, input_ids)  #  compute logprobs for the input tokens
-
-    def _move_model_to_vllm(self):
-
-        # FSPD with model sharding
-        # - we move wrapped module at a time
-        if (
-            self.accelerator.state.fsdp_plugin is not None and
-            self.use_vllm
-        ):
-            from torch.distributed.fsdp.fully_sharded_data_parallel import FullyShardedDataParallel as FSDP, FSDP_WRAPPED_MODULE
-            from torch.distributed.fsdp._common_utils import _get_handle_fqns_from_root
-
-            # pointed to the llm model
-            llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
-
-            # FSDP does not have a nice function to unshard module by module
-            # - so we need to use a lot of internals
-            # - maybe cleaner way is to install a forward hook and do one dummy 
-            #   forward
-            from torch.distributed.fsdp._unshard_param_utils import _unshard_params_for_summon
-            if not hasattr(self, '_fsdp_modules'):
-
-                # memorize the traversal because it will be very slow
-                import torch.distributed.fsdp._traversal_utils as traversal_utils
-                self._fsdp_modules = traversal_utils._get_fsdp_states_with_modules(self.model)
-
-            # needs to be done for all ranks now
-            for state, module in zip(*self._fsdp_modules):
-                with _unshard_params_for_summon(
-                    module=module,
-                    state=state,
-                    writeback=False,
-                    rank0_only=False,
-                    offload_to_cpu=False,
-                    with_grads=False,
-                ):
-
-                    state_dict = {} # for this FSDP module only
-                    for key, param_info in zip(
-                        _get_handle_fqns_from_root(state, state._handle), 
-                        state._flat_param._param_infos
-                    ):
-                        state_dict[key] = getattr(param_info.module, param_info.param_name)
-
-                    # load the partial state dict
-                    llm_model.load_weights(state_dict.items())
-                    del state_dict
-
-            return 
-
-        # Temporary disable other paths
-        return
-
-        with (
-            unwrap_model_for_generation(self.model, self.accelerator) as unwrapped_model
-        ):
-            if is_compiled_module(unwrapped_model):
-                unwrapped_model = unwrapped_model._orig_mod
-            if is_peft_model(unwrapped_model):
-                unwrapped_model.merge_adapter()
-                state_dict = unwrapped_model.state_dict()
-                # Remove base_model and base_layer prefixes
-                state_dict = {
-                    k.removeprefix("base_model.model.").replace(".base_layer", ""): v for k, v in state_dict.items()
-                }
-                # Remove values with adapter prefix (example: "_lora")
-                state_dict = {k: v for k, v in state_dict.items() if unwrapped_model.prefix not in k}
-                # When module to save, remove its prefix and discard the original module
-                state_dict = {
-                    k.replace("modules_to_save.default.", ""): v
-                    for k, v in state_dict.items()
-                    if "original_module" not in k
-                }
-            else:
-                state_dict = unwrapped_model.state_dict()
-
-            # needs to be done for all ranks now
-            llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
-            llm_model.load_weights(state_dict.items())
-
-            # Unmerge the adapter to restore the model to its original state.
-            # This must be done after loading weights to ensure they correspond to the merged state.
-            if is_peft_model(unwrapped_model):
-                unwrapped_model.unmerge_adapter()
-
     def _prepare_inputs(self, inputs: dict[str, Union[torch.Tensor, Any]]) -> dict[str, Union[torch.Tensor, Any]]:
         device = self.accelerator.device
-        prompts = [x["prompt"] for x in inputs]
-        prompts_text = [maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in inputs]
-        prompt_inputs = self.processing_class(
-            prompts_text, return_tensors="pt", padding=True, padding_side="left", add_special_tokens=False
-        )
-        prompt_inputs = super()._prepare_inputs(prompt_inputs)
-        prompt_ids, prompt_mask = prompt_inputs["input_ids"], prompt_inputs["attention_mask"]
+        # prompts = [x["prompt"] for x in inputs]
+        # prompts_text = [maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in inputs]
+        # prompt_inputs = self.processing_class(
+        #     prompts_text, return_tensors="pt", padding=True, padding_side="left", add_special_tokens=False
+        # )
+        # prompt_inputs = super()._prepare_inputs(prompt_inputs)
+        # prompt_ids, prompt_mask = prompt_inputs["input_ids"], prompt_inputs["attention_mask"]
 
-        if self.max_prompt_length is not None:
-            prompt_ids = prompt_ids[:, -self.max_prompt_length :]
-            prompt_mask = prompt_mask[:, -self.max_prompt_length :]
+        # if self.max_prompt_length is not None:
+        #     prompt_ids = prompt_ids[:, -self.max_prompt_length :]
+        #     prompt_mask = prompt_mask[:, -self.max_prompt_length :]
+
+        prompt_ids = [151644, 8948, 198, 32, 10435, 1948, 2657, 323, 21388, 13, 576, 1196, 17064, 264, 3405, 11, 323, 279, 21388, 67477, 432, 13, 576, 17847, 1156, 15482, 911, 279, 32711, 1882, 304, 279, 3971, 323, 1221, 5707, 279, 1196, 448, 279, 4226, 13, 576, 32711, 1882, 374, 43810, 2878, 366, 26865, 29, 690, 26865, 29, 323, 279, 4226, 374, 2661, 304, 279, 1124, 79075, 4573, 11, 15576, 11, 600, 1734, 2572, 366, 26865, 29, 32711, 1882, 1588, 690, 26865, 29, 1124, 79075, 90, 9217, 1588, 7810, 151645, 198, 151644, 872, 198, 3862, 374, 264, 4911, 9210, 57960, 15976, 3, 1948, 400, 15, 24884, 43298, 3, 323, 400, 24, 15, 24884, 43298, 3, 1741, 429, 369, 2477, 42224, 25780, 400, 77, 4779, 279, 897, 315, 57960, 52591, 7, 17, 86167, 59, 15976, 15087, 374, 6785, 979, 400, 77, 3, 374, 264, 5248, 315, 400, 18, 3, 1154, 323, 8225, 5937, 13, 576, 8381, 6629, 315, 57960, 15976, 3, 374, 57960, 83, 37018, 90, 79, 15170, 80, 31716, 1154, 1380, 400, 79, 3, 323, 400, 80, 3, 525, 12040, 10250, 6785, 25780, 13, 7379, 400, 79, 10, 80, 3, 659, 151645, 198, 151644, 77091, 198, 10061, 752, 11625, 419, 3019, 553, 3019, 624, 13708, 766, 29]
+        prompt_ids = torch.tensor(prompt_ids, dtype=torch.int32, device=device)
 
         # Generate completions using either vLLM or regular generation
         if self.args.use_vllm:
-            # First, have main process load weights if needed
-            if self.state.global_step != self._last_loaded_step:
-                self._move_model_to_vllm()
-                self._last_loaded_step = self.state.global_step
 
             # Generate completions using vLLM: gather all prompts and use them in a single call in the main process
             # - for safety do a plain tokenization again
-            prompts_tokens = [
-                torch.tensor(x, dtype=torch.int32, device=device)
-                for x in self.processing_class(prompts_text)['input_ids']
-            ]
+            # prompts_tokens = [
+            #     torch.tensor(x, dtype=torch.int32, device=device)
+            #     for x in self.processing_class(prompts_text)['input_ids']
+            # ]
+            # all_prompts_ids = self.vllm_device_manager.gather_tensor_list(prompts_tokens)
+            all_prompts_ids = [prompt_ids]
 
-            # need to gather the tokens from the TP copies
-            all_prompts_ids = self.vllm_device_manager.gather_tensor_list(prompts_tokens)
             outputs = self.llm.generate(
                 prompt_token_ids=[x.tolist() for x in all_prompts_ids], 
                 sampling_params=self.sampling_params, 
                 use_tqdm=False,
-                # use_tqdm=self.accelerator.is_local_main_process
-                # use_tqdm=self.accelerator.process_index == 3
             )
             completion_ids = [
                 torch.tensor(out.token_ids, dtype=torch.int32, device=device)
                 for completions in outputs for out in completions.outputs
             ]
 
-            # Broadcast the completions from the main process to all processes, ensuring each process receives its
-            # corresponding slice.
-            # completion_ids = self.vllm_device_manager.scatter_tensor_list(
-            #     tensors=completion_ids, dtype=torch.int32, batch=len(prompts),
-            # )
-            # Slice to keep only the local part of the data
-            if self.vllm_device_manager.tensor_parallel > 1:
-                process_index = self.vllm_device_manager.local_rank_mini_shard
-                tp_slice = slice(
-                    process_index * len(prompts),
-                    (process_index + 1) * len(prompts),
-                )
-                completion_ids = completion_ids[tp_slice]
-
             # Pad the completions, and concatenate them with the prompts
             completion_ids = pad(completion_ids, padding_value=self.processing_class.pad_token_id)
-            prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)
         else:
-            # Regular generation path
-            with unwrap_model_for_generation(self.model, self.accelerator) as unwrapped_model:
-                prompt_completion_ids = unwrapped_model.generate(
-                    prompt_ids, attention_mask=prompt_mask, generation_config=self.generation_config
-                )
+            pass
 
-            # Compute prompt length and extract completion ids
-            prompt_length = prompt_ids.size(1)
-            prompt_ids = prompt_completion_ids[:, :prompt_length]
-            completion_ids = prompt_completion_ids[:, prompt_length:]
-
-        # Mask everything after the first EOS token
-        is_eos = completion_ids == self.processing_class.eos_token_id
-        eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device)
-        eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
-        sequence_indices = torch.arange(is_eos.size(1), device=device).expand(is_eos.size(0), -1)
-        completion_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int()
-
-        # Concatenate prompt_mask with completion_mask for logit computation
-        attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)  # (B*G, P+C)
-
-        logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
-
-        # with torch.inference_mode():
-        #     if self.ref_model is not None:
-        #         ref_per_token_logps = self._get_per_token_logps(
-        #             self.ref_model, prompt_completion_ids, attention_mask, logits_to_keep
-        #         )
-        #     else:
-        #         with self.accelerator.unwrap_model(self.model).disable_adapter():
-        #             ref_per_token_logps = self._get_per_token_logps(
-        #                 self.model, prompt_completion_ids, attention_mask, logits_to_keep
-        #             )
-
-        # Decode the generated completions
-        completions_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
-        if is_conversational(inputs[0]):
-            completions = []
-            for prompt, completion in zip(prompts, completions_text):
-                bootstrap = prompt.pop()["content"] if prompt[-1]["role"] == "assistant" else ""
-                completions.append([{"role": "assistant", "content": bootstrap + completion}])
-        else:
-            completions = completions_text
-
-        rewards_per_func = torch.zeros(len(prompts), len(self.reward_funcs), device=device)
-        for i, (reward_func, reward_processing_class) in enumerate(
-            zip(self.reward_funcs, self.reward_processing_classes)
-        ):
-            if isinstance(reward_func, nn.Module):  # Module instead of PretrainedModel for compat with compiled models
-                if is_conversational(inputs[0]):
-                    messages = [{"messages": p + c} for p, c in zip(prompts, completions)]
-                    texts = [apply_chat_template(x, reward_processing_class)["text"] for x in messages]
-                else:
-                    texts = [p + c for p, c in zip(prompts, completions)]
-                reward_inputs = reward_processing_class(
-                    texts, return_tensors="pt", padding=True, padding_side="right", add_special_tokens=False
-                )
-                reward_inputs = super()._prepare_inputs(reward_inputs)
-                with torch.inference_mode():
-                    rewards_per_func[:, i] = reward_func(**reward_inputs).logits[:, 0]  # Shape (B*G,)
-            else:
-                # Repeat all input columns (but "prompt" and "completion") to match the number of generations
-                keys = [key for key in inputs[0] if key not in ["prompt", "completion"]]
-                reward_kwargs = {key: [example[key] for example in inputs] for key in keys}
-                output_reward_func = reward_func(prompts=prompts, completions=completions, **reward_kwargs)
-                rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
-
-        # Gather the reward per function: this part is crucial, because the rewards are normalized per group and the
-        # completions may be distributed across processes
-        rewards_per_func = gather(rewards_per_func)
-
-        # Apply weights to each reward function's output and sum
-        rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).sum(dim=1)
-
-        # Compute grouped-wise rewards
-        mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
-        std_grouped_rewards = rewards.view(-1, self.num_generations).std(dim=1)
-
-        # Normalize the rewards to compute the advantages
-        mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
-        std_grouped_rewards = std_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
-        advantages = (rewards - mean_grouped_rewards) / (std_grouped_rewards + 1e-4)
-
-        process_index = self.accelerator.process_index
-
-        # Slice to keep only the local part of the data
-        process_slice = slice(
-            process_index * len(prompts),
-            (process_index + 1) * len(prompts),
-        )
-        advantages = advantages[process_slice]
-
-        # Log the metrics
-        reward_per_func = rewards_per_func.mean(0)
-        for i, reward_func in enumerate(self.reward_funcs):
-            if isinstance(reward_func, nn.Module):  # Module instead of PretrainedModel for compat with compiled models
-                reward_func_name = reward_func.config._name_or_path.split("/")[-1]
-            else:
-                reward_func_name = reward_func.__name__
-            self._metrics[f"rewards/{reward_func_name}"].append(reward_per_func[i].item())
-
-        self._metrics["reward"].append(rewards.mean().item())
-        self._metrics["reward_std"].append(std_grouped_rewards.mean().item())
-
-        if (
-            self.log_completions
-            and self.state.global_step % self.args.logging_steps == 0
-            and "wandb" in self.args.report_to
-        ):
-            import pandas as pd
-
-            # For logging
-            table = {
-                "step": [str(self.state.global_step)] * len(rewards),
-                "prompt": gather_object(prompts_text),
-                "completion": gather_object(completions_text),
-                "reward": rewards.tolist(),
-            }
-            df = pd.DataFrame(table)
-
-            if wandb.run is not None and self.accelerator.is_main_process:
-                wandb.log({"completions": wandb.Table(dataframe=df)})
+        torch.distributed.breakpoint()
+        if self.accelerator.is_local_main_process:
+            print ("text", outputs[0].outputs[0].text)
 
         return {
-            "prompt_ids": prompt_ids,
-            "prompt_mask": prompt_mask,
+            "prompt_ids": prompt_ids.unsqueeze(0),
             "completion_ids": completion_ids,
-            "completion_mask": completion_mask,
-            # "ref_per_token_logps": ref_per_token_logps,
-            "advantages": advantages,
         }
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
@@ -933,119 +700,8 @@ class GRPOTrainer(Trainer):
             raise ValueError("The GRPOTrainer does not support returning outputs")
         # Compute the per-token log probabilities for the model
 
-        prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
-        completion_ids, completion_mask = inputs["completion_ids"], inputs["completion_mask"]
+        prompt_ids = inputs["prompt_ids"]
+        completion_ids = inputs["completion_ids"]
         input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
-        attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
-        logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
-
-        per_token_logps = self._get_per_token_logps(model, input_ids, attention_mask, logits_to_keep)
-
-        # Compute the KL divergence between the model and the reference model
-        # ref_per_token_logps = inputs["ref_per_token_logps"]
-        # per_token_kl = torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
-        per_token_kl = 0
-
-        # x - x.detach() allows for preserving gradients from x
-        advantages = inputs["advantages"]
-
-        ratio = torch.exp(per_token_logps - per_token_logps.detach())
-        # in the forward pass, ratio will be 1, so pg_losses == pg_losses2. But according to the PPO math
-        # https://spinningup.openai.com/en/latest/algorithms/ppo.html, applying the clamp and min will
-        # will regularize the gradients in the backward pass.
-        pg_losses = ratio * advantages.unsqueeze(1) # per-token-loss (no clamp)
-        pg_losses2 = torch.clamp(ratio, 1.0 - self.args.cliprange, 1.0 + self.args.cliprange) * advantages.unsqueeze(1)
-        per_token_loss = torch.min(pg_losses, pg_losses2)
-        per_token_loss = -(per_token_loss - self.beta * per_token_kl)
-        loss = (per_token_loss * completion_mask).sum() / completion_mask.sum()
-
-        # Log the metrics
-        completion_length = self.accelerator.gather_for_metrics(completion_mask.sum(1)).float().mean().item()
-        self._metrics["completion_length"].append(completion_length)
-
-        # mean_kl = (per_token_kl * completion_mask).sum() / completion_mask.sum()
-        # self._metrics["kl"].append(self.accelerator.gather_for_metrics(mean_kl).mean().item())
-
-        return loss
-
-    def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys: Optional[list[str]] = None):
-        inputs = self._prepare_inputs(inputs)
-        with torch.no_grad():
-            with self.compute_loss_context_manager():
-                loss = self.compute_loss(model, inputs)
-            loss = loss.mean().detach()
-        return loss, None, None
-
-    def log(self, logs: dict[str, float], start_time: Optional[float] = None) -> None:
-        metrics = {key: sum(val) / len(val) for key, val in self._metrics.items()}  # average the metrics
-
-        # This method can be called both in training and evaluation. When called in evaluation, the keys in `logs`
-        # start with "eval_". We need to add the prefix "eval_" to the keys in `metrics` to match the format.
-        if next(iter(logs.keys())).startswith("eval_"):
-            metrics = {f"eval_{key}": val for key, val in metrics.items()}
-
-        logs = {**logs, **metrics}
-        if version.parse(transformers.__version__) >= version.parse("4.47.0.dev0"):
-            super().log(logs, start_time)
-        else:  # transformers<=4.46
-            super().log(logs)
-        self._metrics.clear()
-
-    def create_model_card(
-        self,
-        model_name: Optional[str] = None,
-        dataset_name: Optional[str] = None,
-        tags: Union[str, list[str], None] = None,
-    ):
-        """
-        Creates a draft of a model card using the information available to the `Trainer`.
-
-        Args:
-            model_name (`str` or `None`, *optional*, defaults to `None`):
-                Name of the model.
-            dataset_name (`str` or `None`, *optional*, defaults to `None`):
-                Name of the dataset used for training.
-            tags (`str`, `list[str]` or `None`, *optional*, defaults to `None`):
-                Tags to be associated with the model card.
-        """
-        if not self.is_world_process_zero():
-            return
-
-        if hasattr(self.model.config, "_name_or_path") and not os.path.isdir(self.model.config._name_or_path):
-            base_model = self.model.config._name_or_path
-        else:
-            base_model = None
-
-        tags = tags or []
-        if isinstance(tags, str):
-            tags = [tags]
-
-        if hasattr(self.model.config, "unsloth_version"):
-            tags.append("unsloth")
-
-        citation = textwrap.dedent(
-            """\
-            @article{zhihong2024deepseekmath,
-                title        = {{DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models}},
-                author       = {Zhihong Shao and Peiyi Wang and Qihao Zhu and Runxin Xu and Junxiao Song and Mingchuan Zhang and Y. K. Li and Y. Wu and Daya Guo},
-                year         = 2024,
-                eprint       = {arXiv:2402.03300},
-            }
-            """
-        )
-
-        model_card = generate_model_card(
-            base_model=base_model,
-            model_name=model_name,
-            hub_model_id=self.hub_model_id,
-            dataset_name=dataset_name,
-            tags=tags,
-            wandb_url=wandb.run.get_url() if is_wandb_available() and wandb.run is not None else None,
-            comet_url=get_comet_experiment_url(),
-            trainer_name="GRPO",
-            trainer_citation=citation,
-            paper_title="DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models",
-            paper_id="2402.03300",
-        )
-
-        model_card.save(os.path.join(self.args.output_dir, "README.md"))
+        out = model(input_ids, labels=input_ids.long())
+        return out.loss
