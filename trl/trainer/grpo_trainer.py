@@ -586,8 +586,11 @@ class GRPOTrainer(Trainer):
                     'max_position_embeddings': self.max_prompt_length + self.max_completion_length
                 },
                 max_num_seqs=(
-                    self.args.per_device_train_batch_size *
-                    self.vllm_device_manager.tensor_parallel # because of the gather
+                    (
+                        self.args.per_device_train_batch_size *
+                        self.vllm_device_manager.tensor_parallel # because of the gather
+                    ) if self.args.vllm_max_num_seqs is None else
+                    self.args.vllm_max_num_seqs
                 ),
                 tensor_parallel_size=self.vllm_device_manager.tensor_parallel,
                 distributed_executor_backend="external_launcher",

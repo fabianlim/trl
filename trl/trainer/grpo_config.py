@@ -201,6 +201,12 @@ class GRPOConfig(TrainingArguments):
             "context size, which might be much larger than the KV cache, leading to inefficiencies."
         },
     )
+    vllm_max_num_seqs: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": "If not set, will default to per_device_train_batch_size * TP."
+        },
+    )
 
     # Parameters that control the training
     learning_rate: float = field(
