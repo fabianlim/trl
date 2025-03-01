@@ -592,6 +592,7 @@ class GRPOTrainer(Trainer):
                     ) if self.args.vllm_max_num_seqs is None else
                     self.args.vllm_max_num_seqs
                 ),
+                num_gpu_blocks_override=self.args.vllm_num_gpu_blocks_override,
                 tensor_parallel_size=self.vllm_device_manager.tensor_parallel,
                 distributed_executor_backend="external_launcher",
                 # enforce_eager=True, # DEBUG

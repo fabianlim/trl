@@ -207,6 +207,12 @@ class GRPOConfig(TrainingArguments):
             "help": "If not set, will default to per_device_train_batch_size * TP."
         },
     )
+    vllm_num_gpu_blocks_override: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": "overide the number of gpu blocks"
+        },
+    )
 
     # Parameters that control the training
     learning_rate: float = field(
