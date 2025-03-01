@@ -791,8 +791,8 @@ class GRPOTrainer(Trainer):
             outputs = self.llm.generate(
                 prompt_token_ids=[x.tolist() for x in all_prompts_ids], 
                 sampling_params=self.sampling_params, 
-                use_tqdm=False,
-                # use_tqdm=self.accelerator.is_local_main_process
+                # use_tqdm=False,
+                use_tqdm=self.accelerator.is_local_main_process
                 # use_tqdm=self.accelerator.process_index == 3
             )
             completion_ids = [
