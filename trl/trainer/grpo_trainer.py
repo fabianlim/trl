@@ -284,6 +284,30 @@ def fsdp_sharding_policy(auto_wrap_policy, embedding_vocab_size: int = 100000):
         ]
     )
 
+def create_torch_profiler(directory_name: str = 'profiler_traces'):
+
+    profiler = torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ],
+        schedule=torch.profiler.schedule(wait=1, warmup=2, active=3, repeat=1),
+        on_trace_ready=torch.profiler.tensorboard_trace_handler(directory_name),
+        profile_memory=True,
+        with_stack=False,
+        record_shapes=True,
+    )
+
+    class ProfCallback(TrainerCallback):
+        def __init__(self):
+            self.profiler = profiler
+
+        def on_step_end(self, args, state, control, **kwargs):
+            print('profiler step step step')
+            self.profiler.step()
+
+    return ProfCallback()
+
 class GRPOTrainer(Trainer):
     """
     Trainer for the Group Relative Policy Optimization (GRPO) method. This algorithm was initially proposed in the
@@ -640,6 +664,17 @@ class GRPOTrainer(Trainer):
             if isinstance(reward_func, PreTrainedModel):
                 self.reward_funcs[i] = self.accelerator.prepare_model(reward_func, evaluation_mode=True)
 
+        # torch profiler
+        if (
+            os.environ.get('ENABLE_PROFILER', 'false') == 'true'
+            and self.accelerator.is_main_process
+        ):
+            print ('profiler created!!!')
+            profiler_callback = create_torch_profiler(
+                os.path.join(self.args.output_dir, 'profiler_traces')
+            )
+            self.add_callback(profiler_callback)
+
     def _set_signature_columns_if_needed(self):
         # If `self.args.remove_unused_columns` is True, non-signature columns are removed.
         # By default, this method sets `self._signature_columns` to the model's expected inputs.
@@ -791,8 +826,8 @@ class GRPOTrainer(Trainer):
             outputs = self.llm.generate(
                 prompt_token_ids=[x.tolist() for x in all_prompts_ids], 
                 sampling_params=self.sampling_params, 
-                # use_tqdm=False,
-                use_tqdm=self.accelerator.is_local_main_process
+                use_tqdm=False,
+                # use_tqdm=self.accelerator.is_local_main_process
                 # use_tqdm=self.accelerator.process_index == 3
             )
             completion_ids = [
