@@ -571,10 +571,12 @@ class GRPOTrainer(Trainer):
                 #     self.args.per_device_train_batch_size *
                 #     self.vllm_device_manager.tensor_parallel # because of the gather
                 # ),
-                max_num_seqs=1,
+                max_num_seqs=8,
+                num_gpu_blocks_override=500,
                 tensor_parallel_size=self.vllm_device_manager.tensor_parallel,
                 distributed_executor_backend="external_launcher",
                 enable_chunked_prefill=False,
+                # enable_sleep_mode=True,
                 # enforce_eager=True, # DEBUG
             )
             self.sampling_params = SamplingParams(
@@ -675,6 +677,7 @@ class GRPOTrainer(Trainer):
         if self.args.use_vllm:
             # First, have main process load weights if needed
             if self.state.global_step != self._last_loaded_step:
+                # self.llm.wake_up() # assume it is sleeping?
                 self._move_model_to_vllm()
                 self._last_loaded_step = self.state.global_step
 
@@ -694,6 +697,7 @@ class GRPOTrainer(Trainer):
                 # use_tqdm=self.accelerator.is_local_main_process
                 # use_tqdm=self.accelerator.process_index == 3
             )
+            # self.llm.sleep(level=2) # after generate go to sleep?
             completion_ids = [
                 torch.tensor(out.token_ids, dtype=torch.int32, device=device)
                 for completions in outputs for out in completions.outputs
