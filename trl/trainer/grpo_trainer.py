@@ -726,36 +726,59 @@ class GRPOTrainer(Trainer):
             from torch.distributed.fsdp._unshard_param_utils import _unshard_params_for_summon
             if not hasattr(self, '_fsdp_modules'):
 
+                # FSDPv1
                 # memorize the traversal because it will be very slow
-                import torch.distributed.fsdp._traversal_utils as traversal_utils
-                self._fsdp_modules = traversal_utils._get_fsdp_states_with_modules(self.model)
+                # import torch.distributed.fsdp._traversal_utils as traversal_utils
+                # self._fsdp_modules = traversal_utils._get_fsdp_states_with_modules(self.model)
+
+                # FSDPv2
+                from torch.distributed._composable.fsdp import FSDPModule
+                self._fsdp_modules = [
+                    module for module in self.model.modules() if isinstance(module, FSDPModule)
+                ]
 
             # needs to be done for all ranks now
-            for state, module in zip(*self._fsdp_modules):
-                with _unshard_params_for_summon(
-                    module=module,
-                    state=state,
-                    writeback=False,
-                    rank0_only=False,
-                    offload_to_cpu=False,
-                    with_grads=False,
-                ):
+            # FSDPv1
+            # for state, module in zip(*self._fsdp_modules):
+            #     with _unshard_params_for_summon(
+            #         module=module,
+            #         state=state,
+            #         writeback=False,
+            #         rank0_only=False,
+            #         offload_to_cpu=False,
+            #         with_grads=False,
+            #     ):
 
-                    flat_param = state._flat_param
+            #         flat_param = state._flat_param
 
-                    state_dict = {} # for this FSDP module only
-                    for key, param_info in zip(
-                        state._exec_order_data.param_to_fqn[flat_param],
-                        flat_param._param_infos
-                    ):
-                        # if self.accelerator.is_main_process:
-                        #     print ('loaded', key)
-                        state_dict[key] = getattr(param_info.module, param_info.param_name)
+            #         state_dict = {} # for this FSDP module only
+            #         for key, param_info in zip(
+            #             state._exec_order_data.param_to_fqn[flat_param],
+            #             flat_param._param_infos
+            #         ):
+            #             # if self.accelerator.is_main_process:
+            #             #     print ('loaded', key)
+            #             state_dict[key] = getattr(param_info.module, param_info.param_name)
 
-                    # load the partial state dict
+            #         # load the partial state dict
+            #         llm_model.load_weights(state_dict.items())
+            #         del state_dict
+
+            # FSDPv2: done on all ranks
+            for module in self._fsdp_modules:
+
+                # handle the param group
+                param_group = module._get_fsdp_state()._fsdp_param_group
+
+                state_dict = {}
+                for fparam in param_group.fsdp_params:
+                    param_name = fparam._param_fqn
+                    param_name = param_name.replace("._checkpoint_wrapped_module", "")
+                    state_dict[param_name] = fparam.sharded_param.full_tensor()
+
+                # load the module
                     llm_model.load_weights(state_dict.items())
                     del state_dict
-
             return 
 
         with (
