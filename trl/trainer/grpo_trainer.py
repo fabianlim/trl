@@ -777,8 +777,8 @@ class GRPOTrainer(Trainer):
                     state_dict[param_name] = fparam.sharded_param.full_tensor()
 
                 # load the module
-                    llm_model.load_weights(state_dict.items())
-                    del state_dict
+                llm_model.load_weights(state_dict.items())
+                del state_dict
             return 
 
         with (
