@@ -773,6 +773,11 @@ class GRPOTrainer(Trainer):
                 state_dict = {}
                 for fparam in param_group.fsdp_params:
                     param_name = fparam._param_fqn
+                    if param_name is None:
+                        # this means the fsdp model has not yet been lazy init
+                        self.model._get_fsdp_state()._lazy_init()
+                        param_name = fparam._param_fqn # repopulate
+
                     param_name = param_name.replace("._checkpoint_wrapped_module", "")
                     state_dict[param_name] = fparam.sharded_param.full_tensor()
 
