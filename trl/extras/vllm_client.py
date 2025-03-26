@@ -21,22 +21,68 @@ import torch
 from torch import nn
 
 from ..import_utils import is_requests_available, is_vllm_available
-from .vllm_base import BaseVLLMClient
+
+from ..trainer.grpo_config import GRPOConfig
 
 if is_requests_available():
     import requests
     from requests import ConnectionError
 
-
 if is_vllm_available():
     from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
     from vllm.distributed.utils import StatelessProcessGroup
+    from vllm import SamplingParams, LLM
 
+from accelerate import Accelerator
+from accelerate.utils import broadcast_object_list, gather, gather_object, is_peft_model, set_seed
 
 logger = logging.getLogger(__name__)
 
+# abstract base class. All vllm clients must
+# implement these methods
+class VLLMNoopClient:
 
-class VLLMClient(BaseVLLMClient):
+    def __init__(self, process_index: int):
+        self.process_index = process_index
+
+    def generate(
+        self,
+        prompts: list[str],
+        n: int = 1,
+        repetition_penalty: float = 1.0,
+        temperature: float = 1.0,
+        top_p: float = 1.0,
+        top_k: int = -1,
+        min_p: float = 0.0,
+        max_tokens: int = 16,
+        guided_decoding_regex: Optional[str] = None,
+    ) -> list[list[str]]:
+        orig_size = len(prompts)
+        prompts = gather_object(prompts) 
+        completion_ids = [None] * len(prompts)
+        return self._broadcast_and_slice(completion_ids, orig_size)
+
+    def update_named_param(self, name: str, weights: torch.Tensor):
+        pass
+
+    def reset_prefix_cache(self):
+        pass
+
+    def _gather(self, prompts):
+        return gather_object(prompts) 
+
+    def _broadcast_and_slice(self, completion_ids: list, slice_size: int):
+        # Broadcast the completions from the main process to all processes, ensuring each process receives its
+        # corresponding slice
+
+        completion_ids = broadcast_object_list(completion_ids, from_process=0)
+        process_slice = slice(
+            self.process_index * slice_size,
+            (self.process_index + 1) * slice_size,
+        )
+        return completion_ids[process_slice]
+
+class VLLMClient(VLLMNoopClient):
     """
     A client class to interact with a vLLM server.
 
@@ -80,13 +126,17 @@ class VLLMClient(BaseVLLMClient):
     """
 
     def __init__(
-        self, host: str = "0.0.0.0", server_port: int = 8000, group_port: int = 51216, connection_timeout: float = 0.0
+        self, host: str = "0.0.0.0", server_port: int = 8000, group_port: int = 51216, connection_timeout: float = 0.0,
+        distributed: bool = False
     ):
+        super().__init__(process_index=0)
+
         if not is_requests_available():
             raise ImportError("requests is not installed. Please install it with `pip install requests`.")
         if not is_vllm_available():
             raise ImportError("vLLM is not installed. Please install it with `pip install vllm`.")
 
+        self.distributed = distributed
         self.session = requests.Session()
         self.host = host
         self.server_port = server_port
@@ -168,6 +218,16 @@ class VLLMClient(BaseVLLMClient):
             `list[list[int]]`:
                 List of lists of token IDs representing the model-generated completions for each prompt.
         """
+
+        if self.distributed:
+            orig_size = len(prompts)
+            prompts = self._gather(prompts) 
+
+        # Since 'prompts' contains 'num_generations' duplicates, we first take unique prompts, and generate
+        # num_generations outputs for each one. This is faster than generating outputs for each duplicate
+        # prompt individually 
+        prompts = prompts[::n]
+
         url = f"http://{self.host}:{self.server_port}/generate/"
         response = self.session.post(
             url,
@@ -184,9 +244,14 @@ class VLLMClient(BaseVLLMClient):
             },
         )
         if response.status_code == 200:
-            return response.json()["completion_ids"]
+            completion_ids = response.json()["completion_ids"]
         else:
             raise Exception(f"Request failed: {response.status_code}, {response.text}")
+
+        if self.distributed:
+            completion_ids = self._broadcast_and_slice(completion_ids, orig_size)
+
+        return completion_ids
 
     def init_communicator(self):
         """
@@ -265,7 +330,114 @@ class VLLMClient(BaseVLLMClient):
             raise Exception(f"Request failed: {response.status_code}, {response.text}")
 
 
-# Example usage
+
+class VLLMColocationClient:
+    def __init__(self, args: GRPOConfig, model, vllm_device):
+        self.args: GRPOConfig = args
+        self.model = model
+        self.vllm_device = vllm_device
+
+        self.llm = LLM(
+            model=self.model.name_or_path,
+            device=self.vllm_device,
+            gpu_memory_utilization=self.args.vllm_gpu_memory_utilization,
+            dtype=self.args.vllm_dtype,
+            enable_prefix_caching=self.args.vllm_enable_prefix_caching,
+            max_model_len=self.args.vllm_max_model_len,
+            distributed_executor_backend="external_launcher",
+            hf_overrides = {
+                'max_position_embeddings': self.args.vllm_max_model_len
+            },
+        )
+        
+    def update_named_param(self, name: str, weights: torch.Tensor):
+        """
+        Updates a specific named parameter in the model.
+
+        Args:
+            name (`str`):
+                Name of the layer whose weights are being updated.
+            weights (`torch.Tensor`):
+                Tensor containing the updated weights.
+        """
+        llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
+        llm_model.load_weights([(name,weights)])
+
+    def generate(
+        self,
+        prompts: list[str],
+        n: int = 1,
+        repetition_penalty: float = 1.0,
+        temperature: float = 1.0,
+        top_p: float = 1.0,
+        top_k: int = -1,
+        min_p: float = 0.0,
+        max_tokens: int = 16,
+        guided_decoding_regex: Optional[str] = None,
+    ) -> list[list[str]]:
+        """
+        Generates model completions for the provided prompts.
+
+        Args:
+            prompts (`list[str]`):
+                List of text prompts for which the model will generate completions.
+            n (`int`, *optional*, defaults to `1`):
+                Number of completions to generate for each prompt.
+            repetition_penalty (`float`, *optional*, defaults to `1.0`):
+                Parameter for repetition penalty. 1.0 means no penalty.
+            temperature (`float`, *optional*, defaults to `1.0`):
+                Temperature parameter for sampling. Higher values increase diversity.
+            top_p (`float`, *optional*, defaults to `1.0`):
+                Top-p sampling parameter.`1.0` means no truncation.
+            top_k (`int`, *optional*, defaults to `-1`):
+                Top-k sampling parameter. `-1` means no truncation.
+            min_p (`float`, *optional*, defaults to `0.0`):
+                Minimum probability for sampling.
+            max_tokens (`int`, *optional*, defaults to `16`):
+                Maximum number of tokens to generate for each prompt.
+            guided_decoding_regex (`str` or `None`, *optional*, defaults to `None`):
+                Regular expression to guide the decoding process.
+
+        Returns:
+            `list[list[int]]`:
+                List of lists of token IDs representing the model-generated completions for each prompt.
+        """
+        sampling_params = SamplingParams(
+            n=1, # vLLM on each GPU generates only 1 in vllm_colocation mode
+            repetition_penalty=repetition_penalty,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            min_p=min_p,
+            max_tokens=max_tokens,
+            guided_decoding=guided_decoding_regex,
+        )
+        
+        all_outputs = self.llm.generate(
+            prompts, sampling_params=sampling_params, use_tqdm=False
+        )
+        completion_ids = [output.token_ids for outputs in all_outputs for output in outputs.outputs]
+        return completion_ids
+
+    def reset_prefix_cache(self):
+        """
+        Resets the prefix cache for the model.
+        """
+        self.llm.reset_prefix_cache()
+
+# build appropriate client according to config
+def get_vllm_client(args: GRPOConfig, model, accelerator: Accelerator) -> VLLMNoopClient:
+    if args.vllm_colocation:
+        return VLLMColocationClient(args, model, accelerator.device)
+    elif accelerator.is_main_process:
+        return VLLMClient(
+            args.vllm_server_host, args.vllm_server_port, connection_timeout=args.vllm_server_timeout,
+            distributed=accelerator.num_processes > 1,
+        )
+    return VLLMNoopClient(accelerator.process_index)
+    
+
+# Example usage for VLLMCLient
 if __name__ == "__main__":
     from vllm import SamplingParams
 
@@ -280,3 +452,4 @@ if __name__ == "__main__":
 
     model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-7B").to("cuda")
     client.update_model_params(model)
+
